@@ -1321,31 +1321,9 @@ static bool sub2_render(Sub2LeadEngine *eng, float *buffer, uint32_t frames, uin
     s_hq_wide = ((qf & ASMP_QF_HQ_WIDE) != 0) || ((qf & ASMP_QF_UNISON_3OSC) && !(qf & ASMP_QF_UNISON_OFF));
     s_sub2_hp_bypass = (qf & ASMP_QF_UNISON_OFF) != 0;
 
-    /* GOV2時の堅牢カリング: 11voiceで13k>10.6kを起こすCirnoの dense partで
-     * 最弱voiceを緊急リリース(2.7ms, 128サンプル)でフェードアウト。クリック防止で即死IDLEは廃止 */
-    if (qf & ASMP_QF_UNISON_OFF) {
-        int active_tmp = 0;
-        for (int i = 0; i < SUB2_MAX_POLYPHONY; i++) if (eng->voices[i].active) active_tmp++;
-        while (active_tmp > 8) {
-            float min_lvl = 999; int min_idx = -1;
-            for (int i = 0; i < SUB2_MAX_POLYPHONY; i++) {
-                if (eng->voices[i].active && eng->voices[i].env.current_env_level < min_lvl &&
-                    eng->voices[i].env.env_state != SUB_ENV_IDLE && eng->voices[i].env.env_state != SUB_ENV_RELEASE) {
-                    min_lvl = eng->voices[i].env.current_env_level;
-                    min_idx = i;
-                }
-            }
-            if (min_idx < 0) break;
-            VoiceSub2 *v = &eng->voices[min_idx];
-            sub_env_begin_release(&v->env);
-            /* 緊急2.7msリリースでクリック防止 */
-            v->env.release_step = v->env.current_env_level / 128.0f;
-            v->env.release_coeff = sub_exp_approx(6.907755f / 128.0f);
-            v->env.phase_max_samples = 128;
-            v->env.env_samples = 0;
-            active_tmp--;
-        }
-    }
+    /* 黄金律復元: 8音強制カリングを撤廃し、16音完全ポリフォニーを維持する。
+     * 単一オシレータ動作時は 16 音でもデッドラインに余裕があるため、
+     * 強制消音によるブツ切りクリック音や和音欠落を完全に排除する */
 
     for (uint32_t t_start = 0; t_start < frames; t_start += SUB2_MIX_TILE) {
         /* 所有権検証 (Early Abort): 遅延してMainがスロットを再割り当てしていたら直ちに中断 */

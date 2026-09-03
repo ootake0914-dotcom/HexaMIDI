@@ -104,7 +104,6 @@ static bool s_c4_overloaded = false;
 static uint32_t s_c4_migrate_hold = 0;
 
 /* Kick / Metal 動的移行 (Phase 4/5): 移行先が変化した時のみログするための保持値 */
-static uint8_t s_drum_last_target = (uint8_t)ASMP_CORE_SUB4_DRUM;
 
 /* Commit3: 予測型3コア分散用コスト定義 (実測p99に置換予定、現段階は推定) */
 typedef enum {
@@ -494,46 +493,10 @@ static void route_midi_packet(AsmpSharedContext *shared, const AsmpPacket *pkt)
             return;
         }
 
-        bool migratable = (routed.msg_type == ASMP_MSG_NOTE_ON);
-        if (migratable) {
-            /* Commit3: 予測型3コア分散 (コスト+予約で最軽コアへ) */
-            uint32_t cost = drum_cost_for_note(routed.data1);
-            uint32_t b2 = shared->core[ASMP_CORE_SUB2_LEAD].render_busy_us;
-            uint32_t b3 = shared->core[ASMP_CORE_SUB3_BASS].render_busy_us;
-            uint32_t b4 = shared->core[ASMP_CORE_SUB4_DRUM].render_busy_us;
-            uint32_t p2 = b2 + s_reserved_us[ASMP_CORE_SUB2_LEAD];
-            uint32_t p3 = b3 + s_reserved_us[ASMP_CORE_SUB3_BASS];
-            uint32_t p4 = b4 + s_reserved_us[ASMP_CORE_SUB4_DRUM];
-            uint32_t best_pred = p2 + cost;
-            uint8_t best_core = ASMP_CORE_SUB2_LEAD;
-            if (p3 + cost < best_pred) { best_pred = p3 + cost; best_core = ASMP_CORE_SUB3_BASS; }
-            if (p4 + cost < best_pred) { best_pred = p4 + cost; best_core = ASMP_CORE_SUB4_DRUM; }
-            uint32_t limit = s_current_budget_us * 75u / 100u;
-            /* 犯人C: 3コアとも限界なら弱打は静かに落とす（可聴影響最小） */
-            bool all_over = (p2 + cost >= limit) && (p3 + cost >= limit) && (p4 + cost >= limit);
-            if (all_over && routed.data2 < 40) {
-                shared->diag_queue_drop++;
-                return;
-            }
-            /* 二段目: 最軽コアの予測が予算100%超えなら中打 (vel<80) も落とす。
-             * この一打を足しても締切に間に合わず Sub5 フェードで結局消えるため、
-             * アクセント (vel>=80) の締切を守る方を優先する。75%超でも残った
-             * 強打は常に最軽コアへ分散する (候補単一より分散。旧コードの
-             * if/else両枝同一＝デッド分岐を整理し、実効ある二段間引きにした) */
-            if (all_over && routed.data2 < 80 &&
-                best_pred >= s_current_budget_us) {
-                shared->diag_queue_drop++;
-                return;
-            }
-            target_core = best_core;
-            s_reserved_us[best_core] += cost;
-            if (target_core != s_drum_last_target) {
-                s_drum_last_target = target_core;
-            }
-        } else {
-            /* NOTE_OFF等は従来通りC4へ (one-shotのため実質到達不要) */
-            target_core = ASMP_CORE_SUB4_DRUM;
-        }
+        /* 黄金律復元: 全ドラム (Kick/Snare/HiHat/Tom/Cymbal) は
+         * 専用の高品質音源コア (Core4) へ 100% 確実に配送する。
+         * メロディ/ベースコアへの分散や中打ドロップによる音質劣化・音抜けを完全根絶 */
+        target_core = ASMP_CORE_SUB4_DRUM;
     } else {
         r = &s_route[routed.channel & 0x0Fu];
         target_core = r->core;
@@ -618,10 +581,9 @@ static void route_midi_packet(AsmpSharedContext *shared, const AsmpPacket *pkt)
         bool hot = (busy > s_current_budget_us);
         bool hard_full = (vc >= 16u);
         bool saturated = hard_full || hot;
-        if (saturated && routed.data2 < 64) {
-            shared->diag_queue_drop++;
-            return;
-        }
+        /* 黄金律復元: 通常演奏ノートのドロップを完全撤廃。
+         * 全ノートを演奏コアへ届け、演奏コアの最古・最弱音ボイススチールに任せる。
+         * 飽和時は thin (unison解除) のみで負荷を下げ、音符の欠落を防ぐ */
         bool thin = saturated || (vc >= 14u);
         uint8_t prog_eff = r->program_set ? r->program
             : ((target_core == ASMP_CORE_SUB2_LEAD) ? 0u : 33u);
