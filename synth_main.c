@@ -678,15 +678,24 @@ int main(int argc, char *argv[])
         /* スパイク検知時のタイムライン出力 (write >= 15ms or pipe >= 15ms or underrun 発生時) */
         static uint32_t s_prev_und = 0;
         uint32_t cur_und = audio_player_get_underruns();
-        if (sec_write >= 15u || sec_pipe >= 15u || cur_und > s_prev_und) {
-            async_logf("[SPIKE] it=%u chunk=%ums [begin=%uu joy=%uu sd=%uu pipe=%uu write=%uu(wait=%u)] apb=%u und=%u\n",
+        if (sec_write >= 11u || sec_pipe >= 11u || cur_und > s_prev_und) {
+            AsmpSharedContext *sc_diag = asmp_manager_context(&s_asmp_mgr);
+            uint32_t b1=0, b2=0, b3=0, b4=0, b5=0, v2=0, v3=0;
+            if (sc_diag) {
+                b1 = sc_diag->core[ASMP_CORE_SUB1_SEQ].render_busy_us;
+                b2 = sc_diag->core[ASMP_CORE_SUB2_LEAD].render_busy_us;
+                b3 = sc_diag->core[ASMP_CORE_SUB3_BASS].render_busy_us;
+                b4 = sc_diag->core[ASMP_CORE_SUB4_DRUM].render_busy_us;
+                b5 = sc_diag->core[ASMP_CORE_SUB5_DSP].render_busy_us;
+                v2 = sc_diag->core[ASMP_CORE_SUB2_LEAD].voice_count;
+                v3 = sc_diag->core[ASMP_CORE_SUB3_BASS].voice_count;
+            }
+            async_logf("[SPIKE] it=%u pipe=%ums [S1:%uu S2:%uu(v%u) S3:%uu(v%u) S4:%uu S5:%uu] und=%u\n",
                        (unsigned int)loop_iteration,
-                       (unsigned int)((GetMonotonicUs() - chunk_start_us) / 1000ull),
-                       (unsigned int)us_begin, (unsigned int)us_joy, (unsigned int)us_sd,
-                       (unsigned int)sec_pipe * 1000u, (unsigned int)us_write,
-                       (unsigned int)sw_wait_this,
-                       (unsigned int)audio_player_get_free_apb(),
-                       (unsigned int)cur_und);
+                       (unsigned int)sec_pipe,
+                       (unsigned int)b1, (unsigned int)b2, (unsigned int)v2,
+                       (unsigned int)b3, (unsigned int)v3, (unsigned int)b4,
+                       (unsigned int)b5, (unsigned int)cur_und);
         }
         s_prev_und = cur_und;
 #endif

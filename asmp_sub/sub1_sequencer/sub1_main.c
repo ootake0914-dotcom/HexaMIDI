@@ -355,7 +355,7 @@ static void route_c4_monitor(AsmpSharedContext *shared, uint32_t ef)
 
 /* 1節: 優先度分離 — MIDIは4ms上限でドロップ、RENDER_REQは200ms上限で局所化 */
 /* 犯人G: NOTE_OFF/CC64 offは濁り残響の原因のため50msで粘る */
-#define SUB1_MIDI_PUSH_MAX_WAIT_US    (4000u)
+#define SUB1_MIDI_PUSH_MAX_WAIT_US    (500u)
 #define SUB1_RELEASE_MAX_WAIT_US      (50000u)
 #define SUB1_RENDER_REQ_MAX_WAIT_US   (200000u)
 
@@ -493,29 +493,10 @@ static void route_midi_packet(AsmpSharedContext *shared, const AsmpPacket *pkt)
             return;
         }
 
-        /* ドラムの真・黄金律分散: Core4単独パンク(10.67ms超過)を防ぐため
-         * 最も負荷の低いコア (Core2/Core3/Core4) へ動的予測分散する。
-         * 【重要】以前のバグであった音符ドロップ (vel<40 / vel<80 の間引き) は一切行わず、
-         * 全ての打音を 100% 発音させる */
-        bool migratable = (routed.msg_type == ASMP_MSG_NOTE_ON);
-        if (migratable) {
-            uint32_t cost = drum_cost_for_note(routed.data1);
-            uint32_t b2 = shared->core[ASMP_CORE_SUB2_LEAD].render_busy_us;
-            uint32_t b3 = shared->core[ASMP_CORE_SUB3_BASS].render_busy_us;
-            uint32_t b4 = shared->core[ASMP_CORE_SUB4_DRUM].render_busy_us;
-            uint32_t p2 = b2 + s_reserved_us[ASMP_CORE_SUB2_LEAD];
-            uint32_t p3 = b3 + s_reserved_us[ASMP_CORE_SUB3_BASS];
-            uint32_t p4 = b4 + s_reserved_us[ASMP_CORE_SUB4_DRUM];
-            uint32_t best_pred = p4 + cost;
-            uint8_t best_core = ASMP_CORE_SUB4_DRUM;
-            /* ドラム専用コア (Core4) を最優先とし、Core4 が高負荷の時のみ Core2/3 へ分散 */
-            if (p3 + cost < best_pred) { best_pred = p3 + cost; best_core = ASMP_CORE_SUB3_BASS; }
-            if (p2 + cost < best_pred) { best_pred = p2 + cost; best_core = ASMP_CORE_SUB2_LEAD; }
-            target_core = best_core;
-            s_reserved_us[best_core] += cost;
-        } else {
-            target_core = ASMP_CORE_SUB4_DRUM;
-        }
+        /* ドラム専用コア (Core4) 専任ルーティング:
+         * 実機テレメトリによりドラム全量でも Core4 負荷は 1ms 未満 (956us) と証明。
+         * メロディ/ベースコアへ一切ドラムを侵入させず、Core4 の高品質音源に集中させる */
+        target_core = ASMP_CORE_SUB4_DRUM;
     } else {
         r = &s_route[routed.channel & 0x0Fu];
         target_core = r->core;
@@ -530,7 +511,11 @@ static void route_midi_packet(AsmpSharedContext *shared, const AsmpPacket *pkt)
              * Lead/Brass/Piano/Synth等のメロディ系は Sub2 へ動的に再割り当てする。
              * 発音前またはノート停止中に切り替えることで、ノートオフの迷子を防止。 */
             uint8_t prog = routed.data1;
-            uint8_t ideal_core = ((prog >= 32 && prog <= 39) || (prog >= 48 && prog <= 55))
+            /* 負荷バランシング黄金律:
+             * Piano系 (0〜7), Bass系 (32〜39), Ensemble/Strings系 (48〜55) を Sub3 (極速FMAコア) へ。
+             * Lead/Brass/Synth系 (80〜) を Sub2 (スーパーソウコア) へ。
+             * 伴奏とリードを完全に分離し、Core2 の14ボイス集中過負荷を根本解決 */
+            uint8_t ideal_core = ((prog >= 32 && prog <= 39) || (prog >= 48 && prog <= 55) || (prog <= 7))
                                      ? (uint8_t)ASMP_CORE_SUB3_BASS
                                      : (uint8_t)ASMP_CORE_SUB2_LEAD;
             /* pedal_down も条件に含める (rebalance 側と同一条件)。

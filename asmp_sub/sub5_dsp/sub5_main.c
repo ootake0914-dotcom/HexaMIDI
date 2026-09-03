@@ -71,7 +71,7 @@
  * タイムアウト後は部分スロットでも即ミックスして done を公開する。
  * ホストシミュレーションはOSスケジューリングで本来より遅いため50msを維持 */
 #ifdef __NuttX__
-#define SUB5_SRC_WAIT_TIMEOUT_MS (12u)
+#define SUB5_SRC_WAIT_TIMEOUT_MS (10u)
 #else
 #define SUB5_SRC_WAIT_TIMEOUT_MS (50u)
 #endif

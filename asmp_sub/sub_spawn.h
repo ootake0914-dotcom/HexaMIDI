@@ -102,7 +102,9 @@ static inline void sub_spawn_build_sub2(SubSpawnDesc *d, uint8_t channel, uint8_
     d->is_bass = 0u;
 
     /* ウェーブテーブル発音: Lead クラシック 4 波 (80-87) 以外は GM マップ */
-    d->wt_active = (prog < 80) ? 1u : 0u;
+    /* 全音色ウェーブテーブル発音 (Q32超高速・バンドリミット高音質):
+     * Lead/Synth (80〜) も Analog Saw テーブルを活用し、PolyBLEP の分岐・除算負荷を完全根絶 */
+    d->wt_active = 1u;
     if (d->wt_active) {
         float wm = subwt_program_to_morph(prog);
         uint8_t ma = (uint8_t)wm;
