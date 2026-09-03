@@ -177,6 +177,14 @@ static inline void sub_spawn_build_sub3(SubSpawnDesc *d, uint8_t channel, uint8_
         /* Bass (32-39): ファットな矩形波/ノコギリ波 + サブオシ重低音 */
         d->wave = (prog == 38) ? SUB_SPAWN_WAVE_SAWTOOTH : SUB_SPAWN_WAVE_SQUARE;
         d->adsr_a = 0.003f; d->adsr_d = 0.180f; d->adsr_s = 0.700f; d->adsr_r = 0.050f;
+    } else if (prog < 8) {
+        /* Acoustic Piano (0-7): 三角波 + パーカッシブ減衰 ADSR (Sub2と音色整合) */
+        d->wave = SUB_SPAWN_WAVE_TRIANGLE;
+        d->adsr_a = 0.003f; d->adsr_d = 0.400f; d->adsr_s = 0.250f; d->adsr_r = 0.090f;
+    } else if (prog >= 16 && prog < 24) {
+        /* Organ (16-23): サイン波 + 高サステイン */
+        d->wave = SUB_SPAWN_WAVE_SINE;
+        d->adsr_a = 0.010f; d->adsr_d = 0.050f; d->adsr_s = 0.900f; d->adsr_r = 0.040f;
     } else if (prog >= 40 && prog < 48) {
         /* Strings (40-47): ノコギリ波 + スローアタック & 高サステイン */
         d->wave = SUB_SPAWN_WAVE_SAWTOOTH;
@@ -206,6 +214,8 @@ static inline void sub_spawn_build_sub3(SubSpawnDesc *d, uint8_t channel, uint8_
         float base_hz, peak_add, q;
         if (is_bass) {                      /* Bass: タイトな重低音 */
             base_hz = 160.0f;  peak_add = 900.0f;  q = 1.10f;
+        } else if (prog < 8) {              /* Piano: 抜けの良い自然な高域 */
+            base_hz = 1200.0f; peak_add = 3000.0f; q = 0.75f;
         } else if (prog >= 40 && prog < 48) { /* Strings: 豊かなストレイン */
             base_hz = 600.0f;  peak_add = 1500.0f; q = 0.80f;
         } else if (prog >= 88 && prog < 96) { /* Pad: 柔らかなローパス */

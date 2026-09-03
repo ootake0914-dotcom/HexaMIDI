@@ -1080,8 +1080,13 @@ static inline void sub_env_begin_release(SubEnvCore *c)
  */
 static inline float sub_env_advance(SubEnvCore *c)
 {
-    /* 高速パス: 発音の大半 (90%以上) を占める SUSTAIN 状態はジャンプテーブルを完全回避 */
+    /* 高速パス: 発音中かつ有効なサステインレベルを持つ場合は即リターン (消音判定漏れ防止) */
     if (c->env_state == SUB_ENV_SUSTAIN) {
+        if (c->current_env_level <= 0.001f) {
+            c->current_env_level = 0.0f;
+            c->env_state = SUB_ENV_IDLE;
+            return 0.0f;
+        }
         return c->current_env_level;
     }
     float env = c->current_env_level;
