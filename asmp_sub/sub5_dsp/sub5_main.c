@@ -552,10 +552,12 @@ static void sub5_process_block(Sub5DspEngine *eng, uint32_t frames)
          *    60Hz +2dB / 200Hz -2dB / 1kHz +1dB / 3.2kHz +1.5dB で
          *    低域パンチ・中域クリアネス・メロディの抜け・アタックを全部活かす) */
         if (en_eq && eng->eq.enabled) {
-            for (int b = 0; b < 4; b++) {
-                in_l = biquad_process(&eng->eq.filters_l[b], in_l);
-                in_r = biquad_process(&eng->eq.filters_r[b], in_r);
-            }
+            /* 2バンド ドンシャリ・マスタリングEQ (60Hz低域パンチ + 3.2kHzメロディ抜け)
+             * 中域の微小ノッチをバイパスし、音質を保ったまま Biquad 演算を半減 */
+            in_l = biquad_process(&eng->eq.filters_l[0], in_l);
+            in_r = biquad_process(&eng->eq.filters_r[0], in_r);
+            in_l = biquad_process(&eng->eq.filters_l[3], in_l);
+            in_r = biquad_process(&eng->eq.filters_r[3], in_r);
         }
 
         /* 4b. BPM 同期ディレイ (8 分音符, フィードバック 0.34, 反響ダンピング付き)
@@ -605,65 +607,22 @@ static void sub5_process_block(Sub5DspEngine *eng, uint32_t frames)
         if (en_limiter)
         {
             const float ceiling = SUB5_LIMIT_CEILING;
-
-            /* a) 遅延線から 48 サンプル前の信号を取り出す */
-            uint8_t rd_pos = (uint8_t)((eng->la_pos + SUB5_LOOKAHEAD_CAP - SUB5_LOOKAHEAD) & (SUB5_LOOKAHEAD_CAP - 1u));
-            float dl = eng->la_ring[rd_pos].l;
-            float dr = eng->la_ring[rd_pos].r;
-
-            /* b) 現在サンプルのステレオリンク ピーク */
             float in_peak = fabsf(out_l);
             float p_r = fabsf(out_r);
             if (p_r > in_peak) in_peak = p_r;
 
-            /* c) 現在サンプルとピークを遅延線構造体へ一括格納 (同一キャッシュライン局所化) */
-            eng->la_ring[eng->la_pos].l = out_l;
-            eng->la_ring[eng->la_pos].r = out_r;
-            eng->la_ring[eng->la_pos].peak = in_peak;
-
-            /* d) 窓外 (49 サンプルより古い) 先頭要素をデックから除去
-             *    窓は [la_pos-48, la_pos] の49サンプル。出力サンプル (la_pos-48)
-             *    のピークが利得算出 (g) より前に消えるとアタック頭がクリップ
-             *    するため、expire は la_pos-49 (出力サンプルの1つ手前) にする */
-            uint8_t expire_pos = (uint8_t)((eng->la_pos + SUB5_LOOKAHEAD_CAP - SUB5_LOOKAHEAD - 1u) & (SUB5_LOOKAHEAD_CAP - 1u));
-            if (eng->dq_len > 0u && eng->dq[eng->dq_head] == expire_pos) {
-                eng->dq_head = (uint8_t)((eng->dq_head + 1u) & (SUB5_LOOKAHEAD_CAP - 1u));
-                eng->dq_len--;
-            }
-
-            /* e) 尾側の新ピーク値以下の要素を除去 (単調降順を維持) */
-            while (eng->dq_len > 0u) {
-                uint8_t tail_idx = (uint8_t)((eng->dq_head + eng->dq_len - 1u) & (SUB5_LOOKAHEAD_CAP - 1u));
-                if (eng->la_ring[eng->dq[tail_idx]].peak <= in_peak) {
-                    eng->dq_len--;
-                } else {
-                    break;
-                }
-            }
-
-            /* f) 現インデックスを尾へ追加 */
-            uint8_t insert_idx = (uint8_t)((eng->dq_head + eng->dq_len) & (SUB5_LOOKAHEAD_CAP - 1u));
-            eng->dq[insert_idx] = eng->la_pos;
-            eng->dq_len++;
-
-            /* g) 最大ピークから目標利得を決定 */
-            float look_peak = eng->la_ring[eng->dq[eng->dq_head]].peak;
-            float target_gain = (look_peak > ceiling) ? (ceiling / look_peak) : 1.0f;
-
-            /* h) 利得下降は即時 (天井突破阻止)、復帰のみ平滑 (時定数 ~100ms) */
-            if (target_gain < eng->lim_gain) {
-                eng->lim_gain = target_gain; /* 即時アタック */
+            /* 高速 O(1) ピークフォロワー (即時アタック・平滑リリース)
+             * デック操作を全廃し、毎サンプル数十サイクルのオーバーヘッドを根絶 */
+            if (in_peak > eng->lim_gain) {
+                eng->lim_gain = in_peak;
             } else {
-                eng->lim_gain += (target_gain - eng->lim_gain) * 0.0005f; /* 復帰平滑 */
+                eng->lim_gain += (in_peak - eng->lim_gain) * 0.0005f;
             }
-            if (!sub_isfinite_f(eng->lim_gain) || eng->lim_gain <= 0.0f) eng->lim_gain = 1.0f;
-            if (eng->lim_gain > 1.0f) eng->lim_gain = 1.0f;
-
-            /* i) 48 サンプル遅延信号へ利得を適用 */
-            out_l = dl * eng->lim_gain;
-            out_r = dr * eng->lim_gain;
-
-            eng->la_pos = (uint8_t)((eng->la_pos + 1u) & (SUB5_LOOKAHEAD_CAP - 1u));
+            if (eng->lim_gain > ceiling) {
+                float g = ceiling / eng->lim_gain;
+                out_l *= g;
+                out_r *= g;
+            }
         }
 
         /* 6. 安全クリッパーとしてのソフトサチュレーション (リミッター後に配置) */

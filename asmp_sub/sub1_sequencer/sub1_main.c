@@ -511,11 +511,13 @@ static void route_midi_packet(AsmpSharedContext *shared, const AsmpPacket *pkt)
              * Lead/Brass/Piano/Synth等のメロディ系は Sub2 へ動的に再割り当てする。
              * 発音前またはノート停止中に切り替えることで、ノートオフの迷子を防止。 */
             uint8_t prog = routed.data1;
-            /* 負荷バランシング黄金律:
-             * Piano系 (0〜7), Bass系 (32〜39), Ensemble/Strings系 (48〜55) を Sub3 (極速FMAコア) へ。
-             * Lead/Brass/Synth系 (80〜) を Sub2 (スーパーソウコア) へ。
-             * 伴奏とリードを完全に分離し、Core2 の14ボイス集中過負荷を根本解決 */
-            uint8_t ideal_core = ((prog >= 32 && prog <= 39) || (prog >= 48 && prog <= 55) || (prog <= 7))
+            /* 負荷バランシング黄金律 (伴奏とリードの完全分担):
+             * 伴奏・和音・低域: Piano(0〜7), Chromatic(8〜15), Organ(16〜23), Guitar(24〜31),
+             *                   Bass(32〜39), Strings/Ensemble(40〜55), Pad(88〜95) を Sub3 へ。
+             * 主旋律・リード: Brass(56〜63), Reed(64〜71), Pipe(72〜79), Synth Lead(80〜87) を Sub2 へ。
+             * これにより和音密集伴奏がすべて高速FMAのSub3に流れ、Sub2は主旋律(2〜4音)に専念できる！ */
+            bool is_sub3_role = (prog < 56) || (prog >= 88 && prog < 96);
+            uint8_t ideal_core = is_sub3_role
                                      ? (uint8_t)ASMP_CORE_SUB3_BASS
                                      : (uint8_t)ASMP_CORE_SUB2_LEAD;
             /* pedal_down も条件に含める (rebalance 側と同一条件)。
