@@ -1,0 +1,39 @@
+#
+# For a description of the syntax of this configuration file,
+# see the file kconfig-language.txt in the NuttX tools repository.
+#
+
+config EXAMPLES_SYNTH
+	tristate "Sony Spresense Software Synthesizer & Music Player"
+	default n
+	---help---
+		Enable the Spresense software synthesizer and music player application.
+
+if EXAMPLES_SYNTH
+
+config EXAMPLES_SYNTH_PROGNAME
+	string "Program name"
+	default "synth"
+	---help---
+		This is the name of the program that will be used in the shell.
+
+config EXAMPLES_SYNTH_PRIORITY
+	int "Synth task priority"
+	default 100
+
+config EXAMPLES_SYNTH_STACKSIZE
+	int "Synth stack size"
+	default 16384
+
+config EXAMPLES_SYNTH_MULTICORE
+	bool "ASMP 6-core distributed synthesis (SubCore 1-5 workers)"
+	default n
+	select FS_ROMFS
+	---help---
+		Enable the fully distributed 6-core rendering pipeline.
+		SubCore 1: MIDI sequencer, SubCore 2/3/4: tone generators,
+		SubCore 5: master EQ & reverb DSP.
+		Worker ELFs are embedded into nuttx.spk via ROMFS
+		(CONFIG_FS_ROMFS is selected automatically).
+
+endif

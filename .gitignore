@@ -1,0 +1,11 @@
+build_vs/
+.vs/
+*.Zone.Identifier
+*:Zone.Identifier
+
+# Internal docs & audit logs
+docs/
+audit/
+scratch/
+*.spk
+*.wav

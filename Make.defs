@@ -1,0 +1,8 @@
+############################################################################
+# Make.defs
+# Sony Spresense SDK (NuttX) Application Integration
+############################################################################
+
+ifneq ($(CONFIG_EXAMPLES_SYNTH),)
+CONFIGURED_APPS += $(APPDIR)/examples/synth
+endif
