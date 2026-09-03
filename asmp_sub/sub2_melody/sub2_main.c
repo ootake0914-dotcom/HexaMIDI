@@ -605,18 +605,20 @@ static void sub2_render_wt5(VoiceSub2 * __restrict v, const SubChannel * __restr
             uint32_t chunk = tile_frames - f4;
             if (chunk > 4) chunk = 4;
     
-            /* 4 サンプル毎の LFO ビブラート / ピッチ増分更新 */
-            v->vib_phase += v->vib_inc * 4.0f;
-            if (v->vib_phase >= 1.0f) v->vib_phase -= 1.0f;
-            float vib_semi = vib_depth * sub_lookup_sine(g_sine_lut, v->vib_phase);
-            float inc_f = v->base_increment * sub_semitone_ratio(ch_bend + vib_semi + drift_semi);
-            v->phase_increment = inc_f;
-            const float Q32 = 4294967296.0f;
-            iq0 = (uint32_t)(inc_f * Q32);
-            iq1 = (uint32_t)(inc_f * SUB2_DETUNE_RATIO_HI  * Q32);
-            iq2 = (uint32_t)(inc_f * SUB2_DETUNE_RATIO_LO  * Q32);
-            iq3 = (uint32_t)(inc_f * detune_hi2 * Q32);
-            iq4 = (uint32_t)(inc_f * detune_lo2 * Q32);
+            /* 4 サンプル毎の LFO ビブラート / ピッチ増分更新 (変調時のみ計算し、静的音色はスキップ) */
+            if (vib_depth > 0.001f || ch_bend != 0.0f) {
+                v->vib_phase += v->vib_inc * 4.0f;
+                if (v->vib_phase >= 1.0f) v->vib_phase -= 1.0f;
+                float vib_semi = vib_depth * sub_lookup_sine(g_sine_lut, v->vib_phase);
+                float inc_f = v->base_increment * sub_semitone_ratio(ch_bend + vib_semi + drift_semi);
+                v->phase_increment = inc_f;
+                const float Q32 = 4294967296.0f;
+                iq0 = (uint32_t)(inc_f * Q32);
+                iq1 = (uint32_t)(inc_f * SUB2_DETUNE_RATIO_HI  * Q32);
+                iq2 = (uint32_t)(inc_f * SUB2_DETUNE_RATIO_LO  * Q32);
+                iq3 = (uint32_t)(inc_f * detune_hi2 * Q32);
+                iq4 = (uint32_t)(inc_f * detune_lo2 * Q32);
+            }
     
             for (uint32_t k = 0; k < chunk; k++) {
                 uint32_t f = f4 + k;
@@ -656,18 +658,20 @@ static void sub2_render_wt5(VoiceSub2 * __restrict v, const SubChannel * __restr
             uint32_t chunk = tile_frames - f4;
             if (chunk > 4) chunk = 4;
     
-            /* 4 サンプル毎の LFO ビブラート / ピッチ増分更新 */
-            v->vib_phase += v->vib_inc * 4.0f;
-            if (v->vib_phase >= 1.0f) v->vib_phase -= 1.0f;
-            float vib_semi = vib_depth * sub_lookup_sine(g_sine_lut, v->vib_phase);
-            float inc_f = v->base_increment * sub_semitone_ratio(ch_bend + vib_semi + drift_semi);
-            v->phase_increment = inc_f;
-            const float Q32 = 4294967296.0f;
-            iq0 = (uint32_t)(inc_f * Q32);
-            iq1 = (uint32_t)(inc_f * SUB2_DETUNE_RATIO_HI  * Q32);
-            iq2 = (uint32_t)(inc_f * SUB2_DETUNE_RATIO_LO  * Q32);
-            iq3 = (uint32_t)(inc_f * detune_hi2 * Q32);
-            iq4 = (uint32_t)(inc_f * detune_lo2 * Q32);
+            /* 4 サンプル毎の LFO ビブラート / ピッチ増分更新 (変調時のみ計算し、静的音色はスキップ) */
+            if (vib_depth > 0.001f || ch_bend != 0.0f) {
+                v->vib_phase += v->vib_inc * 4.0f;
+                if (v->vib_phase >= 1.0f) v->vib_phase -= 1.0f;
+                float vib_semi = vib_depth * sub_lookup_sine(g_sine_lut, v->vib_phase);
+                float inc_f = v->base_increment * sub_semitone_ratio(ch_bend + vib_semi + drift_semi);
+                v->phase_increment = inc_f;
+                const float Q32 = 4294967296.0f;
+                iq0 = (uint32_t)(inc_f * Q32);
+                iq1 = (uint32_t)(inc_f * SUB2_DETUNE_RATIO_HI  * Q32);
+                iq2 = (uint32_t)(inc_f * SUB2_DETUNE_RATIO_LO  * Q32);
+                iq3 = (uint32_t)(inc_f * detune_hi2 * Q32);
+                iq4 = (uint32_t)(inc_f * detune_lo2 * Q32);
+            }
     
             for (uint32_t k = 0; k < chunk; k++) {
                 uint32_t f = f4 + k;
@@ -740,16 +744,18 @@ static void sub2_render_wt3(VoiceSub2 * __restrict v, const SubChannel * __restr
             uint32_t chunk = tile_frames - f4;
             if (chunk > 4) chunk = 4;
     
-            /* 4 サンプル毎の LFO ビブラート / ピッチ増分更新 */
-            v->vib_phase += v->vib_inc * 4.0f;
-            if (v->vib_phase >= 1.0f) v->vib_phase -= 1.0f;
-            float vib_semi = vib_depth * sub_lookup_sine(g_sine_lut, v->vib_phase);
-            float inc_f = v->base_increment * sub_semitone_ratio(ch_bend + vib_semi + drift_semi);
-            v->phase_increment = inc_f;
-            const float Q32 = 4294967296.0f;
-            iq0 = (uint32_t)(inc_f * Q32);
-            iq1 = (uint32_t)(inc_f * SUB2_DETUNE_RATIO_HI * Q32);
-            iq2 = (uint32_t)(inc_f * SUB2_DETUNE_RATIO_LO * Q32);
+            /* 4 サンプル毎の LFO ビブラート / ピッチ増分更新 (変調時のみ計算し、静的音色はスキップ) */
+            if (vib_depth > 0.001f || ch_bend != 0.0f) {
+                v->vib_phase += v->vib_inc * 4.0f;
+                if (v->vib_phase >= 1.0f) v->vib_phase -= 1.0f;
+                float vib_semi = vib_depth * sub_lookup_sine(g_sine_lut, v->vib_phase);
+                float inc_f = v->base_increment * sub_semitone_ratio(ch_bend + vib_semi + drift_semi);
+                v->phase_increment = inc_f;
+                const float Q32 = 4294967296.0f;
+                iq0 = (uint32_t)(inc_f * Q32);
+                iq1 = (uint32_t)(inc_f * SUB2_DETUNE_RATIO_HI * Q32);
+                iq2 = (uint32_t)(inc_f * SUB2_DETUNE_RATIO_LO * Q32);
+            }
     
             for (uint32_t k = 0; k < chunk; k++) {
                 uint32_t f = f4 + k;
@@ -787,16 +793,18 @@ static void sub2_render_wt3(VoiceSub2 * __restrict v, const SubChannel * __restr
             uint32_t chunk = tile_frames - f4;
             if (chunk > 4) chunk = 4;
     
-            /* 4 サンプル毎の LFO ビブラート / ピッチ増分更新 */
-            v->vib_phase += v->vib_inc * 4.0f;
-            if (v->vib_phase >= 1.0f) v->vib_phase -= 1.0f;
-            float vib_semi = vib_depth * sub_lookup_sine(g_sine_lut, v->vib_phase);
-            float inc_f = v->base_increment * sub_semitone_ratio(ch_bend + vib_semi + drift_semi);
-            v->phase_increment = inc_f;
-            const float Q32 = 4294967296.0f;
-            iq0 = (uint32_t)(inc_f * Q32);
-            iq1 = (uint32_t)(inc_f * SUB2_DETUNE_RATIO_HI * Q32);
-            iq2 = (uint32_t)(inc_f * SUB2_DETUNE_RATIO_LO * Q32);
+            /* 4 サンプル毎の LFO ビブラート / ピッチ増分更新 (変調時のみ計算し、静的音色はスキップ) */
+            if (vib_depth > 0.001f || ch_bend != 0.0f) {
+                v->vib_phase += v->vib_inc * 4.0f;
+                if (v->vib_phase >= 1.0f) v->vib_phase -= 1.0f;
+                float vib_semi = vib_depth * sub_lookup_sine(g_sine_lut, v->vib_phase);
+                float inc_f = v->base_increment * sub_semitone_ratio(ch_bend + vib_semi + drift_semi);
+                v->phase_increment = inc_f;
+                const float Q32 = 4294967296.0f;
+                iq0 = (uint32_t)(inc_f * Q32);
+                iq1 = (uint32_t)(inc_f * SUB2_DETUNE_RATIO_HI * Q32);
+                iq2 = (uint32_t)(inc_f * SUB2_DETUNE_RATIO_LO * Q32);
+            }
     
             for (uint32_t k = 0; k < chunk; k++) {
                 uint32_t f = f4 + k;
@@ -867,14 +875,16 @@ static void sub2_render_wt1(VoiceSub2 * __restrict v, const SubChannel * __restr
             uint32_t chunk = tile_frames - f4;
             if (chunk > 4) chunk = 4;
     
-            /* 4 サンプル毎の LFO ビブラート / ピッチ増分更新 */
-            v->vib_phase += v->vib_inc * 4.0f;
-            if (v->vib_phase >= 1.0f) v->vib_phase -= 1.0f;
-            float vib_semi = vib_depth * sub_lookup_sine(g_sine_lut, v->vib_phase);
-            float inc_f = v->base_increment * sub_semitone_ratio(ch_bend + vib_semi + drift_semi);
-            v->phase_increment = inc_f;
-            const float Q32 = 4294967296.0f;
-            iq0 = (uint32_t)(inc_f * Q32);
+            /* 4 サンプル毎の LFO ビブラート / ピッチ増分更新 (変調時のみ計算し、静的音色はスキップ) */
+            if (vib_depth > 0.001f || ch_bend != 0.0f) {
+                v->vib_phase += v->vib_inc * 4.0f;
+                if (v->vib_phase >= 1.0f) v->vib_phase -= 1.0f;
+                float vib_semi = vib_depth * sub_lookup_sine(g_sine_lut, v->vib_phase);
+                float inc_f = v->base_increment * sub_semitone_ratio(ch_bend + vib_semi + drift_semi);
+                v->phase_increment = inc_f;
+                const float Q32 = 4294967296.0f;
+                iq0 = (uint32_t)(inc_f * Q32);
+            }
     
             for (uint32_t k = 0; k < chunk; k++) {
                 uint32_t f = f4 + k;
@@ -905,14 +915,16 @@ static void sub2_render_wt1(VoiceSub2 * __restrict v, const SubChannel * __restr
             uint32_t chunk = tile_frames - f4;
             if (chunk > 4) chunk = 4;
     
-            /* 4 サンプル毎の LFO ビブラート / ピッチ増分更新 */
-            v->vib_phase += v->vib_inc * 4.0f;
-            if (v->vib_phase >= 1.0f) v->vib_phase -= 1.0f;
-            float vib_semi = vib_depth * sub_lookup_sine(g_sine_lut, v->vib_phase);
-            float inc_f = v->base_increment * sub_semitone_ratio(ch_bend + vib_semi + drift_semi);
-            v->phase_increment = inc_f;
-            const float Q32 = 4294967296.0f;
-            iq0 = (uint32_t)(inc_f * Q32);
+            /* 4 サンプル毎の LFO ビブラート / ピッチ増分更新 (変調時のみ計算し、静的音色はスキップ) */
+            if (vib_depth > 0.001f || ch_bend != 0.0f) {
+                v->vib_phase += v->vib_inc * 4.0f;
+                if (v->vib_phase >= 1.0f) v->vib_phase -= 1.0f;
+                float vib_semi = vib_depth * sub_lookup_sine(g_sine_lut, v->vib_phase);
+                float inc_f = v->base_increment * sub_semitone_ratio(ch_bend + vib_semi + drift_semi);
+                v->phase_increment = inc_f;
+                const float Q32 = 4294967296.0f;
+                iq0 = (uint32_t)(inc_f * Q32);
+            }
     
             for (uint32_t k = 0; k < chunk; k++) {
                 uint32_t f = f4 + k;

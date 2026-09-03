@@ -92,7 +92,7 @@ static uint64_t GetMonotonicUs(void)
 #endif
 
 #ifndef SYNTH_RELEASE
-#define SYNTH_RELEASE 1 /* 1 = プロダクション・リリース (ホットパスのログを全廃) */
+#define SYNTH_RELEASE 0 /* 1 = プロダクション・リリース (ホットパスのログを全廃) */
 #endif
 
 

@@ -71,7 +71,7 @@
  * タイムアウト後は部分スロットでも即ミックスして done を公開する。
  * ホストシミュレーションはOSスケジューリングで本来より遅いため50msを維持 */
 #ifdef __NuttX__
-#define SUB5_SRC_WAIT_TIMEOUT_MS (10u)
+#define SUB5_SRC_WAIT_TIMEOUT_MS (14u)
 #else
 #define SUB5_SRC_WAIT_TIMEOUT_MS (50u)
 #endif
@@ -838,7 +838,7 @@ void *subcore5_entry(void *arg)
                 shared->diag_timeout++;
                 /* Commit1: カウンタのみ (同期printf撤廃) */
                 /* 優先4: consec 10でSub4強制クリア要求 (Sub1経由でALL_NOTES_OFF) */
-                if (s_consec_timeout == 10u) {
+                if (s_consec_timeout == 30u) {
                     shared->main_ctrl.sub5_force_clear_req = 1;
                 }
 

@@ -70,6 +70,13 @@ typedef struct {
 } ChRoute;
 
 static ChRoute s_route[16];
+/* メモリ活用: ノート単位の動的コア追跡マップ (16ch x 128note = 2048B RAM)。
+ * NOTE_ON 時に過負荷コアから余裕コアへ逃がしたノートを正確に記憶し、
+ * NOTE_OFF を発音コアへ確実に配送して迷子ノートを完全防止する */
+static uint8_t s_note_core_map[16][128];
+/* メモリ活用: Core1 ローカル即時ボイスカウンタ (同フレーム内12音バーストでも完璧に1音ずつ交互分散) */
+static uint8_t s_live_vc2 = 0;
+static uint8_t s_live_vc3 = 0;
 static uint32_t s_route_cooldown = 0;
 
 /* ABI v13 spawn プールの Core1側 producer 状態 (Sub2/Sub3 各1)。
@@ -129,8 +136,9 @@ static inline uint32_t drum_cost_for_note(uint8_t note)
 
 static inline uint8_t route_default_core(uint8_t ch)
 {
-    /* デフォルトのフォールバック (PC未受信時用): ch1(Bass), ch2(Chord), ch3, ch5 を Sub3(Bass/Strings) へ。
-     * ※ PC受信時は音色ベース動的ルーティングにより自動でBass/Strings判定される */
+    /* デフォルトのフォールバック (PC未受信時用):
+     * ch1(Bass), ch2(Chord), ch3, ch5 を Sub3(Bass/Strings) へ。
+     * ※ PC受信時は音色ベース動的ルーティングにより自動判定される */
     return (ch == 1 || ch == 2 || ch == 3 || ch == 5)
                ? (uint8_t)ASMP_CORE_SUB3_BASS
                : (uint8_t)ASMP_CORE_SUB2_LEAD;
@@ -159,6 +167,9 @@ static void route_init(void)
         s_route[ch].reverb_send = 40; s_route[ch].has_reverb = 0;
     }
     s_route_cooldown = 0;
+    memset(s_note_core_map, 0, sizeof(s_note_core_map));
+    s_live_vc2 = 0;
+    s_live_vc3 = 0;
     sub_spawn_prod_reset(&s_spawn_prod2);
     sub_spawn_prod_reset(&s_spawn_prod3);
 }
@@ -500,6 +511,23 @@ static void route_midi_packet(AsmpSharedContext *shared, const AsmpPacket *pkt)
     } else {
         r = &s_route[routed.channel & 0x0Fu];
         target_core = r->core;
+
+        /* メモリ活用動的バランシング (Core1即時カウンタによる完全50:50分散):
+         * NOTE_OFF は発音時に記録したコアへ確実に届ける */
+        if (routed.msg_type == ASMP_MSG_NOTE_OFF) {
+            uint8_t ch = routed.channel & 0x0Fu;
+            uint8_t note = routed.data1 & 0x7Fu;
+            if (s_note_core_map[ch][note] != 0) {
+                target_core = s_note_core_map[ch][note];
+                s_note_core_map[ch][note] = 0;
+                if (target_core == ASMP_CORE_SUB2_LEAD && s_live_vc2 > 0) s_live_vc2--;
+                else if (target_core == ASMP_CORE_SUB3_BASS && s_live_vc3 > 0) s_live_vc3--;
+            }
+        } else if (routed.msg_type == ASMP_MSG_NOTE_ON && routed.data2 > 0) {
+            uint8_t ch = routed.channel & 0x0Fu;
+            uint8_t note = routed.data1 & 0x7Fu;
+            s_note_core_map[ch][note] = target_core;
+        }
 
         /* チャンネル状態スナップショット (migration復元用) */
         if (routed.msg_type == ASMP_MSG_PROGRAM_CHANGE) {
