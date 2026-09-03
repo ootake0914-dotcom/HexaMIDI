@@ -22,6 +22,7 @@
 #endif
 
 #include "sub_common.h"
+#include "sub_spawn.h"
 #include "rt_profile.h"
 #include "spatial_audio.h"
 #include "sub_asm.h"
@@ -160,13 +161,8 @@ static void sub3_note_off(Sub3BassEngine *eng, uint8_t channel, uint8_t note);
 /**
  * @brief ノートオン
  */
-static void sub3_note_on(Sub3BassEngine *eng, uint8_t channel, uint8_t note, float velocity)
+static int sub3_voice_alloc(Sub3BassEngine *eng, uint8_t channel, uint8_t note)
 {
-    if (velocity <= 0.0f) {
-        sub3_note_off(eng, channel, note);
-        return;
-    }
-
     int voice_idx = -1;
     for (int i = 0; i < SUB3_MAX_POLYPHONY; i++) {
         if (eng->voices[i].active && eng->voices[i].channel == channel && eng->voices[i].note == note) {
@@ -220,11 +216,21 @@ static void sub3_note_on(Sub3BassEngine *eng, uint8_t channel, uint8_t note, flo
         }
         voice_idx = (quiet_idx >= 0) ? quiet_idx : oldest_idx;
     }
+    return voice_idx;
+}
 
-    VoiceSub3 *v = &eng->voices[voice_idx];
+/**
+ * @brief ディスクリプタからの発音実体化 (ABI v13 fast-spawn)
+ * @details 正準 build の出力 + live 状態 + 初期位相でボイスを初期化する。
+ *          係数変換 (exp/tan LUT) のみ演奏コア側で行う。float 式は従来同一。
+ */
+static void sub3_spawn_from_desc(Sub3BassEngine *eng, VoiceSub3 *v, const SubSpawnDesc *d)
+{
+    uint8_t channel = d->channel;
+    float velocity = (float)d->velocity / 127.0f;
     v->active = true;
     v->channel = channel;
-    v->note = note;
+    v->note = d->note;
     v->velocity = velocity;
     v->env.sustained_by_pedal = false;
     v->phase_q = 0;
@@ -235,98 +241,66 @@ static void sub3_note_on(Sub3BassEngine *eng, uint8_t channel, uint8_t note, flo
     /* base_increment は必ず「ベンドなし」の値を保存する。
      * レンダーループが毎回 ch->pitch_bend_semitones を掛けるため、
      * ここでベンド込みの値を保存するとベンドが二重適用される */
-    float base_freq = sub_note_to_freq(note);
-    v->frequency = base_freq;
-    v->base_increment = base_freq / (float)SUB_SAMPLE_RATE;
-    const float Q32 = 4294967296.0f;
-    v->inc_q = (uint32_t)(v->base_increment * Q32);
-
-    uint8_t prog = eng->channels[channel].program;
-    v->is_bass = (prog >= 32 && prog < 40);
-    v->env.adsr.exponential_decay = true;
-
-    if (v->is_bass) {
-        /* Bass (32-39): ファットな矩形波/ノコギリ波 + サブオシ重低音 */
-        v->wave_type = (prog == 38) ? WAVE3_SAWTOOTH : WAVE3_SQUARE;
-        v->env.adsr.attack_time_sec  = 0.003f;
-        v->env.adsr.decay_time_sec   = 0.180f;
-        v->env.adsr.sustain_level    = 0.700f;
-        v->env.adsr.release_time_sec = 0.050f;
-    } else if (prog >= 40 && prog < 48) {
-        /* Strings (40-47): ノコギリ波 + スローアタック & 高サステイン */
-        v->wave_type = WAVE3_SAWTOOTH;
-        v->env.adsr.attack_time_sec  = 0.060f;
-        v->env.adsr.decay_time_sec   = 0.120f;
-        v->env.adsr.sustain_level    = 0.850f;
-        v->env.adsr.release_time_sec = 0.150f;
-    } else if (prog >= 24 && prog < 32) {
-        /* Guitar (24-31): ノコギリ波 + 減衰 */
-        v->wave_type = WAVE3_SAWTOOTH;
-        v->env.adsr.attack_time_sec  = 0.002f;
-        v->env.adsr.decay_time_sec   = 0.220f;
-        v->env.adsr.sustain_level    = 0.400f;
-        v->env.adsr.release_time_sec = 0.060f;
-    } else if (prog >= 88 && prog < 96) {
-        /* Pad / Warm / Choir: 三角波 + ロングエンベロープ */
-        v->wave_type = WAVE3_TRIANGLE;
-        v->env.adsr.attack_time_sec  = 0.100f;
-        v->env.adsr.decay_time_sec   = 0.200f;
-        v->env.adsr.sustain_level    = 0.800f;
-        v->env.adsr.release_time_sec = 0.200f;
-    } else {
-        /* Other / Default: ノコギリ波 */
-        v->wave_type = WAVE3_SAWTOOTH;
-        v->env.adsr.attack_time_sec  = 0.010f;
-        v->env.adsr.decay_time_sec   = 0.100f;
-        v->env.adsr.sustain_level    = 0.700f;
-        v->env.adsr.release_time_sec = 0.080f;
+    v->frequency = sub_note_to_freq(d->note);
+    v->base_increment = d->base_increment;
+    {
+        const float Q32 = 4294967296.0f;
+        v->inc_q = (uint32_t)(d->base_increment * Q32);
     }
+
+    v->is_bass = (d->is_bass != 0u);
+    v->wave_type = (WaveType3)d->wave;
+    v->env.adsr.attack_time_sec = d->adsr_a;
+    v->env.adsr.decay_time_sec = d->adsr_d;
+    v->env.adsr.sustain_level = d->adsr_s;
+    v->env.adsr.release_time_sec = d->adsr_r;
+    v->env.adsr.exponential_decay = (d->exp_decay != 0u);
 
     /* 共通 ADSR コアで発音準備 (ATTACK 開始) */
     sub_env_prepare_attack(&v->env);
 
-    /* ---- ペルボイス共振LPF (低域寄りのキャラクタ) ---- */
-    float base_hz, peak_add, q;
-    if (v->is_bass) {                      /* Bass: タイトな重低音 */
-        base_hz = 160.0f;  peak_add = 900.0f;  q = 1.10f;
-    } else if (prog >= 40 && prog < 48) { /* Strings: 豊かなストレイン */
-        base_hz = 600.0f;  peak_add = 1500.0f; q = 0.80f;
-    } else if (prog >= 88 && prog < 96) { /* Pad: 柔らかなローパス */
-        base_hz = 500.0f;  peak_add = 1200.0f; q = 0.70f;
-    } else {                              /* Default */
-        base_hz = 400.0f;  peak_add = 1600.0f; q = 1.00f;
-    }
-    v->filt_cutoff_base = base_hz;
-    /* キートラッキング: ベースは低音の太さを優先して緩い 0.15 乗則、
-     * それ以外は 0.25 乗則で高音域の開きを確保する */
-    {
-        float kt_exp = v->is_bass ? 0.15f : 0.25f;
-        float kt_in = base_freq * (1.0f / 261.6256f);
-        float keytrack;
-        if (kt_exp == 0.25f) {
-            keytrack = sqrtf(sqrtf(kt_in)); /* 70cyc->12cyc: 0.25乗はsqrt二乗で同値 */
-        } else {
-            keytrack = powf(kt_in, kt_exp); /* bass 0.15は稀な分岐、powf維持 */
-        }
-        if (!(keytrack > 0.55f)) keytrack = 0.55f;   /* NaN/下限ガード */
-        if (keytrack > 2.60f) keytrack = 2.60f;
-        v->filt_cutoff_base *= keytrack;
-        v->filt_peak_hz      = (base_hz + peak_add * (0.35f + 0.65f * velocity)) * keytrack;
-    }
-    v->filt_env         = 1.0f;
-    v->svf_q            = q;   /* タイル毎の係数再計算でも音色別 Q を維持 */
+    /* ペルボイス共振LPF (正準値をそのまま使う) */
+    v->filt_cutoff_base = d->filt_base;
+    v->filt_peak_hz = d->filt_peak;
+    v->filt_env = 1.0f;
+    v->svf_q = d->filt_q;   /* タイル毎の係数再計算でも音色別 Q を維持 */
     {
         float tc_samples = SUB3_FILTER_ENV_TIME * (float)SUB_SAMPLE_RATE;
-        v->filt_env_coeff   = sub_exp_approx(1.0f / tc_samples);
+        v->filt_env_coeff = sub_exp_approx(1.0f / tc_samples);
         v->filt_env_coeff64 = sub_exp_approx((float)SUB3_MIX_TILE / tc_samples);
     }
     sub_svf_reset(&v->svf);
-    sub_svf_set(&v->svf, v->filt_peak_hz, q, (float)SUB_SAMPLE_RATE);
+    sub_svf_set(&v->svf, v->filt_peak_hz, d->filt_q, (float)SUB_SAMPLE_RATE);
     /* HP はバス集約へ移行 (per-voice HP 廃止)。重低音ラムブル除去はタイル後段で実施 */
     v->vib_phase = (float)((eng->lfsr_state++ & 0xFFu)) / 256.0f;
     v->vib_inc = (4.4f + 0.6f * ((eng->lfsr_state >> 8) & 0x3u)) / (float)SUB_SAMPLE_RATE;
     v->vib_depth_st = eng->channels[channel].mod_depth * 0.35f;
     spatial_voice_init(&v->spatial);
+}
+
+/**
+ * @brief ディスクリプタ経由のノートオン (Core1分解送信の受け側)
+ */
+static void sub3_note_on_desc(Sub3BassEngine *eng, const SubSpawnDesc *d)
+{
+    int voice_idx = sub3_voice_alloc(eng, d->channel, d->note);
+    sub3_spawn_from_desc(eng, &eng->voices[voice_idx], d);
+}
+
+/**
+ * @brief ノートオン (従来解釈 = 正準 build 関数に一本化)
+ * @details Core1分解送信とbit一致させるため、解釈は sub_spawn_build_sub3 のみ。
+ */
+static void sub3_note_on(Sub3BassEngine *eng, uint8_t channel, uint8_t note, uint8_t vel)
+{
+    if (vel == 0u) {
+        sub3_note_off(eng, channel, note);
+        return;
+    }
+    int voice_idx = sub3_voice_alloc(eng, channel, note);
+    SubSpawnDesc d;
+    sub_spawn_build_sub3(&d, channel, note, vel, eng->channels[channel].program);
+    sub3_spawn_from_desc(eng, &eng->voices[voice_idx], &d);
 }
 
 /**
@@ -412,7 +386,33 @@ static void sub3_apply_pending_packet(const AsmpPacket *pkt)
                 if (sub_drum_is_kick(pkt->data1)) sub_kick_note_on(&s_sub3_kick, (float)pkt->data2 / 127.0f);
                 else if (sub_drum_is_metal(pkt->data1)) sub_metal_note_on(&s_sub3_metal, pkt->data1, (float)pkt->data2 / 127.0f);
                 else sub_perc_note_on(&s_sub3_perc, pkt->data1, (float)pkt->data2 / 127.0f);
-            } else if (pkt->channel < 16) sub3_note_on(&s_sub3, pkt->channel, pkt->data1, (float)pkt->data2 / 127.0f);
+            } else if (pkt->channel < 16) {
+                /* ABI v13: Core1分解送信トークンが有効なら fast-spawn。
+                 * 無効なら正準 build で従来解釈する (Core1送信とbit一致) */
+                SubSpawnDesc desc;
+                if (pkt->param != 0u &&
+                    sub_spawn_consume(s_sub3.shared->spawn_pool_sub3,
+                                      &s_sub3.shared->spawn_ack_sub3.consumed,
+                                      pkt->param, &desc)) {
+                    s_sub3.shared->spawn_stats_sub3.fast_spawn++;
+                    asmp_dcache_clean((const void *)&s_sub3.shared->spawn_stats_sub3,
+                                      sizeof(s_sub3.shared->spawn_stats_sub3));
+                    ASMP_BARRIER();
+                    sub3_note_on_desc(&s_sub3, &desc);
+                } else {
+                    s_sub3.shared->spawn_stats_sub3.legacy_spawn++;
+                    asmp_dcache_clean((const void *)&s_sub3.shared->spawn_stats_sub3,
+                                      sizeof(s_sub3.shared->spawn_stats_sub3));
+                    ASMP_BARRIER();
+                    if (pkt->param != 0u) {
+                        /* 陳腐トークンの解放 (スロット再利用のため ack のみ) */
+                        sub_spawn_ack_only(s_sub3.shared->spawn_pool_sub3,
+                                           &s_sub3.shared->spawn_ack_sub3.consumed,
+                                           pkt->param);
+                    }
+                    sub3_note_on(&s_sub3, pkt->channel, pkt->data1, pkt->data2);
+                }
+            }
             break;
         case ASMP_MSG_NOTE_OFF:
             if (pkt->channel != 9 && pkt->channel < 16) sub3_note_off(&s_sub3, pkt->channel, pkt->data1);
@@ -682,6 +682,9 @@ static bool sub3_render(Sub3BassEngine *eng, float *buffer, uint32_t frames, uin
     }
 
     eng->shared->core[ASMP_CORE_SUB3_BASS].voice_count = active_count;
+    /* Core1入場整理の飽和判定用に公開 (busy_us と同一規律で clean) */
+    asmp_dcache_clean((const void *)&eng->shared->core[ASMP_CORE_SUB3_BASS].voice_count,
+                      sizeof(eng->shared->core[ASMP_CORE_SUB3_BASS].voice_count));
     return true;
 }
 
@@ -743,10 +746,26 @@ void *subcore3_entry(void *arg)
                             rep = i;
                         }
                     }
-                    if (rep >= 0) s_sub3_pending[rep] = pkt;
+                    if (rep >= 0) {
+                        /* 追い出される NOTE_ON のトークンがあれば解放する。
+                         * [MAX-1] 上書き側は NOTE_ON 不在確定のため不要 */
+                        if (s_sub3_pending[rep].msg_type == ASMP_MSG_NOTE_ON &&
+                            s_sub3_pending[rep].param != 0u) {
+                            sub_spawn_ack_only(shared->spawn_pool_sub3,
+                                               &shared->spawn_ack_sub3.consumed,
+                                               s_sub3_pending[rep].param);
+                        }
+                        s_sub3_pending[rep] = pkt;
+                    }
                     else s_sub3_pending[SUB3_MAX_PENDING - 1] = pkt;
                     shared->diag_queue_drop++;
                 } else {
+                    /* 溢れで捨てる NOTE_ON のトークンも解放する */
+                    if (pkt.msg_type == ASMP_MSG_NOTE_ON && pkt.param != 0u) {
+                        sub_spawn_ack_only(shared->spawn_pool_sub3,
+                                           &shared->spawn_ack_sub3.consumed,
+                                           pkt.param);
+                    }
                     shared->diag_queue_drop++;
                 }
             }

@@ -44,11 +44,11 @@ extern "C" {
 /* ※ #define のみで構造体レイアウトには影響しない (バイナリ互換性維持)        */
 /* ========================================================================= */
 /* [dsp-20260903-p0c] P0-C Render Mailbox & Non-Droppable Control Plane */
-#define HEXASENSE_DSP_TAG "dsp-20260903-q512-mbox"
+#define HEXASENSE_DSP_TAG "dsp-20260903-q512-spawn"
 
 /* ABI whiskey (S1) - 共有コンテキストのレイアウト不一致を起動時に検出 */
 #define ASMP_PROTOCOL_MAGIC   0x48535836u /* "H" "S" "X" "6" */
-#define ASMP_PROTOCOL_VERSION 12u /* 12: render_mbox 64Bライン分離 + main_ctrlライタ分離 (2026-09-03) / 11: q512 + slot gen-guard + owner_mask原子化 / 10: P0-C Render Mailbox + Non-Droppable Control Plane */
+#define ASMP_PROTOCOL_VERSION 13u /* 13: Core1 voice-spawn descriptor pool + stats (2026-09-03) / 12: render_mbox 64Bライン分離 + main_ctrlライタ分離 / 11: q512 + slot gen-guard + owner_mask原子化 / 10: P0-C Render Mailbox + Non-Droppable Control Plane */
 
 /* Ping-Pong スロット数: エポック偶奇で PCM バッファを切り替えることで、
  * SubCore 2-4 の「次エポック合成」と SubCore 5 の「現エポック・ミキシング」を
@@ -325,6 +325,72 @@ typedef struct ASMP_ALIGN32 {
 } ChannelControlState;
 
 /* ========================================================================= */
+/* ABI v13: Core1 voice-spawn descriptor (MIDI分解のCore1集約)                */
+/* 生MIDI解釈 (program->音色/ADSR/フィルタ、note->Q32増分/周波数) を Core1    */
+/* (Sub1) へ集約し、演奏コア (Sub2/Sub3) は spawn-frozen パラメータの受領と   */
+/* 発音のみ行う。同一 program はどのコア・どの順序でも同一正準マッピングで   */
+/* 発音されるため、移動前後やPC到達順序による音色・音程の不一致 (音痴) を     */
+/* 構造的に根絶する。発音中に live 追従すべきもの (bend/vol/pan/expr/mod/CC)  */
+/* は含まず、従来通り演奏コア側チャンネル状態を毎タイル読む (MIDI意味論維持)。*/
+/* 輸送: NOTE_ON.param にトークン [31:24]magic [23:8]gen [7:0]slot を添付。   */
+/* プール満杯・世代不一致時は param=0 の従来解釈経路へ自動フォールバックする  */
+/* (フォールバックも同一正準関数で解釈するため音は一致する)。                */
+/* ========================================================================= */
+#define SUB_SPAWN_POOL_SLOTS (16u)
+#define SUB_SPAWN_TOKEN_MAGIC (0x5Au)
+
+/** Core1 が事前解決する note-on パラメータ (52B)。
+ *  WaveType2 (sub2) / WaveType3 (sub3) と同順 (SINE=0/SQUARE=1/SAW=2/TRI=3) の
+ *  波形番号を wave に格納する。enum 順序を変えたら本定義と同時更新すること */
+#define SUB_SPAWN_WAVE_SINE     (0u)
+#define SUB_SPAWN_WAVE_SQUARE   (1u)
+#define SUB_SPAWN_WAVE_SAWTOOTH (2u)
+#define SUB_SPAWN_WAVE_TRIANGLE (3u)
+
+typedef struct {
+    uint8_t  channel;
+    uint8_t  note;
+    uint8_t  velocity;      /**< humanize済み 1..127 */
+    uint8_t  program;       /**< 解決に使った program (記録・診断用) */
+    float    frequency;     /**< bend-free 基本周波数 (freq LUT初期式とbit一致) */
+    float    base_increment;/**< frequency / 48000 (従来式と同一) */
+    float    adsr_a, adsr_d, adsr_s, adsr_r;
+    uint8_t  exp_decay;
+    uint8_t  wave;          /**< SUB_SPAWN_WAVE_* */
+    uint8_t  is_bass;       /**< Sub3 サブオシ判定 (prog 32..39) */
+    uint8_t  unison;        /**< Sub2 スーパーソウ判定 (Core1で間引き時は強制薄化) */
+    uint8_t  wt_active;     /**< Sub2 ウェーブテーブル発音 (prog < 80) */
+    uint8_t  morph_a, morph_b;
+    uint8_t  mip;
+    float    filt_base, filt_peak, filt_q;
+    float    morph_w;
+} SubSpawnDesc; /* 4 + 8 + 16 + 8 + 16 = 52B */
+
+/** SPSC ディスクリプタスロット (96B = 32B×3ライン)。
+ *  line0: gen のみ (Core1 writer)。desc (line1-2) と同居させないことで
+ *  世代公開とペイロード公開の順序をキャッシュライン単位で分離する */
+typedef struct ASMP_ALIGN32 {
+    volatile uint32_t gen;   /**< 0=無効, 1..単調増加 (Core1のみ書き込み) */
+    uint8_t _pad0[28];       /**< line0 残 */
+    SubSpawnDesc desc;        /**< line1-2 (Core1のみ書き込み、52B) */
+    uint8_t _pad1[12];        /**< 4+28+52+12 = 96B */
+} SubSpawnSlot;
+
+/** spawn 消費カウンタ (演奏コア single writer、コア毎に32B分離) */
+typedef struct ASMP_ALIGN32 {
+    volatile uint32_t consumed; /**< 消費 (spawn/ack) 回数 */
+    uint8_t _pad[28];
+} SubSpawnAck;
+
+/** spawn 経路統計 (各演奏コア single writer、コア毎に32B分離。
+ *  テスト・現調用。fast+legacy の合計が受信 NOTE_ON 数に一致する) */
+typedef struct ASMP_ALIGN32 {
+    volatile uint32_t fast_spawn;   /**< ディスクリプタ fast-spawn 回数 */
+    volatile uint32_t legacy_spawn; /**< 従来解釈フォールバック回数 */
+    uint8_t _pad[24];
+} SubSpawnStats;
+
+/* ========================================================================= */
 /* レイアウト固定アサート (C99互換 typedef トリック): マルチライタ分離のための */
 /* 32Bライン境界をコンパイル時に保証する。いずれか失格したらパディング見直し */
 /* ========================================================================= */
@@ -336,6 +402,11 @@ typedef char asmp_assert_corecell[(sizeof(AsmpCoreCell) == 32) ? 1 : -1];
 typedef char asmp_assert_renderctrl[(sizeof(AsmpRenderCtrl) == 32) ? 1 : -1];
 typedef char asmp_assert_donecell[(sizeof(AsmpDoneCell) == 32) ? 1 : -1];
 typedef char asmp_assert_slotheader[(sizeof(AlignedSlotHeader) == 32) ? 1 : -1];
+typedef char asmp_assert_spawndesc[(sizeof(SubSpawnDesc) == 52) ? 1 : -1];
+typedef char asmp_assert_spawnslot[(sizeof(SubSpawnSlot) == 96) ? 1 : -1];
+typedef char asmp_assert_spawndesc_line[(offsetof(SubSpawnSlot, desc) == 32) ? 1 : -1];
+typedef char asmp_assert_spawnack[(sizeof(SubSpawnAck) == 32) ? 1 : -1];
+typedef char asmp_assert_spawnstats[(sizeof(SubSpawnStats) == 32) ? 1 : -1];
 typedef char asmp_assert_ringbuffer[(sizeof(AsmpRingBuffer) == (size_t)ASMP_QUEUE_CAPACITY * sizeof(AsmpPacket) + 64u) ? 1 : -1];
 typedef char asmp_assert_ringhead[(offsetof(AsmpRingBuffer, head) == (size_t)ASMP_QUEUE_CAPACITY * sizeof(AsmpPacket)) ? 1 : -1];
 typedef char asmp_assert_ringtail[(offsetof(AsmpRingBuffer, tail) == (size_t)ASMP_QUEUE_CAPACITY * sizeof(AsmpPacket) + 32u) ? 1 : -1];
@@ -416,6 +487,17 @@ typedef struct ASMP_ALIGN32 {
 
     /* P0-C: Non-Droppable Control Plane (Main/SD single writer, Sub1/Workers reader) */
     ASMP_ALIGN32 ChannelControlState ch_control;
+
+    /* ABI v13: Core1 voice-spawn プール (各プール Core1 single writer)。
+     * 末尾追加のため既存オフセットは不変。BSS ゼロ初期化で gen=0=無効から開始 */
+    ASMP_ALIGN32 SubSpawnSlot spawn_pool_sub2[SUB_SPAWN_POOL_SLOTS];
+    ASMP_ALIGN32 SubSpawnSlot spawn_pool_sub3[SUB_SPAWN_POOL_SLOTS];
+    /* ABI v13: spawn 消費カウンタ (各演奏コア single writer) */
+    ASMP_ALIGN32 SubSpawnAck spawn_ack_sub2;
+    ASMP_ALIGN32 SubSpawnAck spawn_ack_sub3;
+    /* ABI v13: spawn 経路統計 (各演奏コア single writer、診断用) */
+    ASMP_ALIGN32 SubSpawnStats spawn_stats_sub2;
+    ASMP_ALIGN32 SubSpawnStats spawn_stats_sub3;
 } AsmpSharedContext;
 
 

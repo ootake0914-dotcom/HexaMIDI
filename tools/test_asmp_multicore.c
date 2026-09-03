@@ -34,6 +34,7 @@ static uint32_t GetTickCountMsPort(void)
 #include <stddef.h>
 #include "asmp_protocol.h"
 #include "asmp_manager.h"
+#include "sub_spawn.h"
 
 static void test_asmp_ringbuffer_layout(void)
 {
@@ -529,6 +530,274 @@ static void test_asmp_route_move_restores_state(void)
     printf("  -> PASS: moved channel keeps volume/pan (quiet-left preserved).\n");
 }
 
+/**
+ * @brief ABI v13: spawn プールのレイアウト・トークン検証
+ */
+static void test_asmp_spawn_pool_layout(void)
+{
+    printf("[TEST] Testing voice-spawn pool layout (ABI v13)...\n");
+    assert(sizeof(SubSpawnDesc) == 52);
+    assert(sizeof(SubSpawnSlot) == 96);
+    assert(offsetof(SubSpawnSlot, desc) == 32);
+    assert(sizeof(SubSpawnAck) == 32);
+    assert(sizeof(SubSpawnStats) == 32);
+    AsmpSharedContext ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    assert(((uintptr_t)&ctx.spawn_pool_sub2[0] % 32) == 0);
+    assert(((uintptr_t)&ctx.spawn_pool_sub3[0] % 32) == 0);
+    assert(((uintptr_t)&ctx.spawn_ack_sub2 % 32) == 0);
+    assert(((uintptr_t)&ctx.spawn_stats_sub3 % 32) == 0);
+    /* トークン往復 */
+    {
+        uint16_t g = 0;
+        uint8_t idx = 0;
+        uint32_t tok = sub_spawn_token(7u, 3u);
+        assert(sub_spawn_token_parse(tok, &g, &idx) && g == 7u && idx == 3u);
+        assert(!sub_spawn_token_parse(0u, &g, &idx));
+        assert(!sub_spawn_token_parse(sub_spawn_token(0u, 1u), &g, &idx)); /* gen0拒否 */
+        assert(!sub_spawn_token_parse(sub_spawn_token(5u, SUB_SPAWN_POOL_SLOTS), &g, &idx)); /* slot範囲外拒否 */
+    }
+    printf("  -> PASS: spawn pool 96B slots, gen line isolated, token codec OK.\n");
+}
+
+/**
+ * @brief 回帰: PC理想配置移動のペダルガード (踏み中の移動禁止)
+ *        踏み→発音→離鍵→PC48 の順で、保持音が旧コアに残り、移動しないこと。
+ *        ガードなし旧実装では PC で移動して後続 CC64-off が新コアへ流れ、
+ *        旧コアの保持音が stuck する (moved で S2==1 が残る)。
+ */
+static void test_asmp_route_move_pedal_guard(void)
+{
+    printf("[TEST] Testing route-move pedal guard (no move while sustained)...\n");
+
+    AsmpManager mgr;
+    int ret = asmp_manager_init(&mgr);
+    assert(ret == 0);
+    ret = asmp_manager_start_cores(&mgr);
+    assert(ret == 0);
+    test_sleep_ms(50);
+
+    {
+        AsmpPacket stop = { .msg_type = ASMP_MSG_CMD_STOP };
+        assert(asmp_manager_send_command(&mgr, ASMP_CORE_SUB1_SEQ, &stop));
+    }
+    int16_t pcm[ASMP_BUFFER_FRAMES * 2];
+    for (int i = 0; i < 8; i++) {
+        assert(asmp_manager_sync_render_frame(&mgr, pcm, ASMP_BUFFER_FRAMES) == 0);
+    }
+
+    /* 踏み→発音(60)→離鍵→PC48 (ideal=Sub3)。保持音は Sub2 に残り、移動しない */
+    {
+        AsmpPacket pedal_on = { .msg_type = ASMP_MSG_CONTROL_CHANGE, .channel = 8, .data1 = 64, .data2 = 127 };
+        AsmpPacket on = { .msg_type = ASMP_MSG_NOTE_ON, .channel = 8, .data1 = 60, .data2 = 100 };
+        AsmpPacket off = { .msg_type = ASMP_MSG_NOTE_OFF, .channel = 8, .data1 = 60 };
+        AsmpPacket pc = { .msg_type = ASMP_MSG_PROGRAM_CHANGE, .channel = 8, .data1 = 48 };
+        assert(asmp_manager_send_command(&mgr, ASMP_CORE_SUB1_SEQ, &pedal_on));
+        assert(asmp_manager_send_command(&mgr, ASMP_CORE_SUB1_SEQ, &on));
+        assert(asmp_manager_send_command(&mgr, ASMP_CORE_SUB1_SEQ, &off));
+        assert(asmp_manager_send_command(&mgr, ASMP_CORE_SUB1_SEQ, &pc));
+    }
+    const AsmpSharedContext *shm = asmp_manager_context(&mgr);
+    for (int i = 0; i < 10; i++) {
+        assert(asmp_manager_sync_render_frame(&mgr, pcm, ASMP_BUFFER_FRAMES) == 0);
+    }
+    printf("     held: voices S2=%u S3=%u (expect S2>=1, S3==0)\n",
+            shm->core[ASMP_CORE_SUB2_LEAD].voice_count,
+            shm->core[ASMP_CORE_SUB3_BASS].voice_count);
+    assert(shm->core[ASMP_CORE_SUB2_LEAD].voice_count >= 1);
+    assert(shm->core[ASMP_CORE_SUB3_BASS].voice_count == 0);
+
+    /* ペダル解放で保持音が消え、次回 PC48 で Sub3 へ移動すること。
+     * 識別点は旧コア Sub2 の消音: ガードなし旧実装では pedal_off が移動先の
+     * Sub3 へ流れて旧コアの保持音が stuck し、S2 が 1 のまま残る。
+     * (Piano R=90ms のため 25epoch 待てば離鍵完了のはず) */
+    {
+        AsmpPacket pedal_off = { .msg_type = ASMP_MSG_CONTROL_CHANGE, .channel = 8, .data1 = 64, .data2 = 0 };
+        AsmpPacket pc = { .msg_type = ASMP_MSG_PROGRAM_CHANGE, .channel = 8, .data1 = 48 };
+        AsmpPacket on = { .msg_type = ASMP_MSG_NOTE_ON, .channel = 8, .data1 = 62, .data2 = 100 };
+        assert(asmp_manager_send_command(&mgr, ASMP_CORE_SUB1_SEQ, &pedal_off));
+        assert(asmp_manager_send_command(&mgr, ASMP_CORE_SUB1_SEQ, &pc));
+        assert(asmp_manager_send_command(&mgr, ASMP_CORE_SUB1_SEQ, &on));
+    }
+    for (int i = 0; i < 25; i++) {
+        if (asmp_manager_sync_render_frame(&mgr, pcm, ASMP_BUFFER_FRAMES) != 0) break;
+    }
+    printf("     moved: voices S2=%u S3=%u (expect S2==0, S3>=1)\n",
+            shm->core[ASMP_CORE_SUB2_LEAD].voice_count,
+            shm->core[ASMP_CORE_SUB3_BASS].voice_count);
+    assert(shm->core[ASMP_CORE_SUB2_LEAD].voice_count == 0);
+    assert(shm->core[ASMP_CORE_SUB3_BASS].voice_count >= 1);
+
+    {
+        AsmpPacket off = { .msg_type = ASMP_MSG_ALL_NOTES_OFF };
+        asmp_manager_send_command(&mgr, ASMP_CORE_SUB1_SEQ, &off);
+    }
+    for (int i = 0; i < 8; i++) {
+        if (asmp_manager_sync_render_frame(&mgr, pcm, ASMP_BUFFER_FRAMES) != 0) break;
+    }
+
+    asmp_manager_stop_cores(&mgr);
+    printf("  -> PASS: pedal-held channel stays put, moves after release.\n");
+}
+
+/**
+ * @brief ABI v13: Core1分解送信が fast-spawn 経路で発音すること
+ *        Sub1経由の NOTE_ON が全てディスクリプタ経路 (fast_spawn) を通り、
+ *        音声エネルギーも正常に生成されることを検証する。
+ */
+static void test_asmp_spawn_fast_path_used(void)
+{
+    printf("[TEST] Testing Core1 decomposed spawn (fast path counters)...\n");
+
+    AsmpManager mgr;
+    int ret = asmp_manager_init(&mgr);
+    assert(ret == 0);
+    ret = asmp_manager_start_cores(&mgr);
+    assert(ret == 0);
+    test_sleep_ms(50);
+
+    /* ch0 (Sub2) と ch1 (Sub3) に発音。どちらも Core1 が分解送信するはず */
+    {
+        AsmpPacket on0 = { .msg_type = ASMP_MSG_NOTE_ON, .channel = 0, .data1 = 60, .data2 = 100 };
+        AsmpPacket on1 = { .msg_type = ASMP_MSG_NOTE_ON, .channel = 1, .data1 = 48, .data2 = 100 };
+        AsmpPacket on2 = { .msg_type = ASMP_MSG_NOTE_ON, .channel = 0, .data1 = 64, .data2 = 100 };
+        assert(asmp_manager_send_command(&mgr, ASMP_CORE_SUB1_SEQ, &on0));
+        assert(asmp_manager_send_command(&mgr, ASMP_CORE_SUB1_SEQ, &on1));
+        assert(asmp_manager_send_command(&mgr, ASMP_CORE_SUB1_SEQ, &on2));
+    }
+    int16_t pcm[ASMP_BUFFER_FRAMES * 2];
+    int64_t energy = 0;
+    for (int i = 0; i < 12; i++) {
+        assert(asmp_manager_sync_render_frame(&mgr, pcm, ASMP_BUFFER_FRAMES) == 0);
+        for (uint32_t s = 0; s < ASMP_BUFFER_FRAMES * 2; s++) energy += abs(pcm[s]);
+    }
+    const AsmpSharedContext *shm = asmp_manager_context(&mgr);
+    printf("     fast[S2:%u S3:%u] legacy[S2:%u S3:%u] energy=%lld\n",
+            (unsigned)shm->spawn_stats_sub2.fast_spawn,
+            (unsigned)shm->spawn_stats_sub3.fast_spawn,
+            (unsigned)shm->spawn_stats_sub2.legacy_spawn,
+            (unsigned)shm->spawn_stats_sub3.legacy_spawn,
+            (long long)energy);
+    assert(shm->spawn_stats_sub2.fast_spawn >= 2u);
+    assert(shm->spawn_stats_sub3.fast_spawn >= 1u);
+    assert(shm->spawn_stats_sub2.legacy_spawn == 0u);
+    assert(shm->spawn_stats_sub3.legacy_spawn == 0u);
+    assert(energy > 10000);
+
+    {
+        AsmpPacket off = { .msg_type = ASMP_MSG_ALL_NOTES_OFF };
+        asmp_manager_send_command(&mgr, ASMP_CORE_SUB1_SEQ, &off);
+    }
+    for (int i = 0; i < 8; i++) {
+        if (asmp_manager_sync_render_frame(&mgr, pcm, ASMP_BUFFER_FRAMES) != 0) break;
+    }
+
+    asmp_manager_stop_cores(&mgr);
+    printf("  -> PASS: all routed NOTE_ONs took the decomposed fast path.\n");
+}
+
+/**
+ * @brief Core1入場整理: 飽和時の弱音シェッドと強音の到達保証
+ *        Sub2 を16音で飽和させ、弱音バースト (vel30) が全て Core1 で間引かれ
+ *        (diag_queue_drop += 24)、強音 (vel110) は必ず発音されることを検証。
+ *        旧動作ではキュー満杯のランダム落としで強音が消えることがあった。
+ */
+static void test_asmp_admission_triage(void)
+{
+    printf("[TEST] Testing Core1 admission triage (shed weak, keep strong)...\n");
+
+    AsmpManager mgr;
+    int ret = asmp_manager_init(&mgr);
+    assert(ret == 0);
+    ret = asmp_manager_start_cores(&mgr);
+    assert(ret == 0);
+    test_sleep_ms(50);
+
+    {
+        AsmpPacket stop = { .msg_type = ASMP_MSG_CMD_STOP };
+        assert(asmp_manager_send_command(&mgr, ASMP_CORE_SUB1_SEQ, &stop));
+    }
+    int16_t pcm[ASMP_BUFFER_FRAMES * 2];
+    for (int i = 0; i < 8; i++) {
+        assert(asmp_manager_sync_render_frame(&mgr, pcm, ASMP_BUFFER_FRAMES) == 0);
+    }
+    const AsmpSharedContext *shm = asmp_manager_context(&mgr);
+
+    /* 1. Sub2 を16音サステインで飽和させる (ch0, vel100, 異ピッチ) */
+    for (int i = 0; i < 16; i++) {
+        AsmpPacket on = { .msg_type = ASMP_MSG_NOTE_ON, .channel = 0,
+                          .data1 = (uint8_t)(40 + i), .data2 = 100 };
+        assert(asmp_manager_send_command(&mgr, ASMP_CORE_SUB1_SEQ, &on));
+    }
+    for (int i = 0; i < 6; i++) {
+        assert(asmp_manager_sync_render_frame(&mgr, pcm, ASMP_BUFFER_FRAMES) == 0);
+    }
+    printf("     saturated: voices S2=%u (expect 16)\n",
+            shm->core[ASMP_CORE_SUB2_LEAD].voice_count);
+    assert(shm->core[ASMP_CORE_SUB2_LEAD].voice_count == 16u);
+    uint32_t drop_base = shm->diag_queue_drop;
+
+    /* 2. 弱音バースト 24発 (vel30)。全て Core1 で間引かれるはず */
+    for (int i = 0; i < 24; i++) {
+        AsmpPacket on = { .msg_type = ASMP_MSG_NOTE_ON, .channel = 0,
+                          .data1 = (uint8_t)(60 + i), .data2 = 30 };
+        assert(asmp_manager_send_command(&mgr, ASMP_CORE_SUB1_SEQ, &on));
+    }
+    {
+        int spins = 0;
+        while (shm->diag_queue_drop - drop_base < 24u && spins < 40) {
+            assert(asmp_manager_sync_render_frame(&mgr, pcm, ASMP_BUFFER_FRAMES) == 0);
+            spins++;
+        }
+    }
+    printf("     shed weak: diag_drop delta=%u (expect 24), voices S2=%u (expect 16)\n",
+            (unsigned)(shm->diag_queue_drop - drop_base),
+            shm->core[ASMP_CORE_SUB2_LEAD].voice_count);
+    assert(shm->diag_queue_drop - drop_base == 24u);
+    assert(shm->core[ASMP_CORE_SUB2_LEAD].voice_count == 16u);
+    drop_base = shm->diag_queue_drop;
+
+    /* 3. 強音 4発 (vel110)。間引き対象外で、必ず発音されること */
+    static const uint8_t strong_notes[4] = { 84, 85, 86, 87 };
+    for (int i = 0; i < 4; i++) {
+        AsmpPacket on = { .msg_type = ASMP_MSG_NOTE_ON, .channel = 0,
+                          .data1 = strong_notes[i], .data2 = 110 };
+        assert(asmp_manager_send_command(&mgr, ASMP_CORE_SUB1_SEQ, &on));
+    }
+    for (int i = 0; i < 6; i++) {
+        assert(asmp_manager_sync_render_frame(&mgr, pcm, ASMP_BUFFER_FRAMES) == 0);
+    }
+    printf("     strong kept: diag_drop delta=%u (expect 0), voices S2=%u (expect 16)\n",
+            (unsigned)(shm->diag_queue_drop - drop_base),
+            shm->core[ASMP_CORE_SUB2_LEAD].voice_count);
+    assert(shm->diag_queue_drop - drop_base == 0u);
+    assert(shm->core[ASMP_CORE_SUB2_LEAD].voice_count == 16u);
+
+    /* 4. 強音だけ離鍵 -> 4音消えて 12音に戻れば、強音が確かに鳴っていた証拠 */
+    for (int i = 0; i < 4; i++) {
+        AsmpPacket off = { .msg_type = ASMP_MSG_NOTE_OFF, .channel = 0,
+                           .data1 = strong_notes[i] };
+        assert(asmp_manager_send_command(&mgr, ASMP_CORE_SUB1_SEQ, &off));
+    }
+    for (int i = 0; i < 25; i++) {
+        if (asmp_manager_sync_render_frame(&mgr, pcm, ASMP_BUFFER_FRAMES) != 0) break;
+    }
+    printf("     strong released: voices S2=%u (expect 12)\n",
+            shm->core[ASMP_CORE_SUB2_LEAD].voice_count);
+    assert(shm->core[ASMP_CORE_SUB2_LEAD].voice_count == 12u);
+
+    {
+        AsmpPacket off = { .msg_type = ASMP_MSG_ALL_NOTES_OFF };
+        asmp_manager_send_command(&mgr, ASMP_CORE_SUB1_SEQ, &off);
+    }
+    for (int i = 0; i < 8; i++) {
+        if (asmp_manager_sync_render_frame(&mgr, pcm, ASMP_BUFFER_FRAMES) != 0) break;
+    }
+
+    asmp_manager_stop_cores(&mgr);
+    printf("  -> PASS: weak shed early at Core1, strong always voiced.\n");
+}
+
 int main(void)
 {
     /* abort() 時も進行状況を失わないよう無バッファ化 */
@@ -540,10 +809,14 @@ int main(void)
     printf("=======================================================\n");
 
     test_asmp_ringbuffer_layout();
+    test_asmp_spawn_pool_layout();
     test_asmp_6core_distributed_pipeline();
     test_asmp_routed_playback();
     test_asmp_pitch_bend_frequency();
     test_asmp_route_move_restores_state();
+    test_asmp_route_move_pedal_guard();
+    test_asmp_spawn_fast_path_used();
+    test_asmp_admission_triage();
     test_asmp_full_burn_stress();
 
     printf("=======================================================\n");

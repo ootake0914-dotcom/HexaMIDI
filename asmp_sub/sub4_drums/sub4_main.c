@@ -756,6 +756,9 @@ static bool sub4_render(Sub4DrumEngine *eng, float *buffer, uint32_t frames, uin
     }
 
     eng->shared->core[ASMP_CORE_SUB4_DRUM].voice_count = active_count;
+    /* C4監視の飽和判定用に公開 (busy_us と同一規律で clean) */
+    asmp_dcache_clean((const void *)&eng->shared->core[ASMP_CORE_SUB4_DRUM].voice_count,
+                      sizeof(eng->shared->core[ASMP_CORE_SUB4_DRUM].voice_count));
     return true;
 }
 

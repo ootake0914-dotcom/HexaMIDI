@@ -24,6 +24,7 @@
 
 #define SUB_COMMON_NO_LUT /* Sub1はLUT未使用、BSS 2KB節約 OPTIMIZATION_MEMO #4 */
 #include "sub_common.h"
+#include "sub_spawn.h"
 #include "rt_profile.h"
 
 /* ヒューマナイズ用 Xorshift32 (rand()置換: ロック不要・スレッドセーフ) */
@@ -70,6 +71,11 @@ typedef struct {
 
 static ChRoute s_route[16];
 static uint32_t s_route_cooldown = 0;
+
+/* ABI v13 spawn プールの Core1側 producer 状態 (Sub2/Sub3 各1)。
+ * route_init でリセットする (再起動時に共有メモリ memset と歩調を合わせる) */
+static SubSpawnProd s_spawn_prod2;
+static SubSpawnProd s_spawn_prod3;
 
 /* チャンネル状態の宛先への復元 (migration 用)。sub1_push_bounded 定義より後で
  * 定義し、ここでは前方宣言する */
@@ -154,6 +160,8 @@ static void route_init(void)
         s_route[ch].reverb_send = 40; s_route[ch].has_reverb = 0;
     }
     s_route_cooldown = 0;
+    sub_spawn_prod_reset(&s_spawn_prod2);
+    sub_spawn_prod_reset(&s_spawn_prod3);
 }
 
 /**
@@ -543,7 +551,12 @@ static void route_midi_packet(AsmpSharedContext *shared, const AsmpPacket *pkt)
             uint8_t ideal_core = ((prog >= 32 && prog <= 39) || (prog >= 48 && prog <= 55))
                                      ? (uint8_t)ASMP_CORE_SUB3_BASS
                                      : (uint8_t)ASMP_CORE_SUB2_LEAD;
-            if (r->active_notes == 0 && r->core != ideal_core) {
+            /* pedal_down も条件に含める (rebalance 側と同一条件)。
+             * ペダル保持中は Note Off 済みでも旧コアで鳴り続けており、ここで
+             * 移動すると後続 CC64-off が新コアへ流れて旧コア保持音が stuck する
+             * (dense部のペダル多用で発症)。踏み中は旧配置に留め、解放後の
+             * 次回 PC で移動する (音は正しく、負荷は次善) */
+            if (r->active_notes == 0 && r->pedal_down == 0 && r->core != ideal_core) {
                 /* 理想配置への移動時は Bank/CC/ベンドの実効状態を先に複製する。
                  * 旧実装は PC パケット自体だけを新コアへ流し、直前の Bank MSB
                  * (同ブロック先行は旧コアへ配送済み) や旧曲由来の Vol/Pan 等が
@@ -583,6 +596,56 @@ static void route_midi_packet(AsmpSharedContext *shared, const AsmpPacket *pkt)
             if (hum < 1) hum = 1;
             if (hum > 127) hum = 127;
             routed.data2 = (uint8_t)hum;
+        }
+    }
+
+    /* Core1 分解送信 (ABI v13): メロディ NOTE_ON は発音パラメータを事前解決し
+     * ディスクリプタで配送する。演奏コアは MIDI 解釈なしで発音できる。
+     * program は Core1 の正準状態 (未受信時は宛先コアの既定値 Sub2=0/Sub3=33)
+     * を使い、キュー順序 (FIFO) により演奏コア側と一致する。
+     * プール満杯時は param=0 のまま従来 NOTE_ON (演奏コアが正準解釈) になる */
+    if (routed.msg_type == ASMP_MSG_NOTE_ON && routed.data2 > 0 && !is_drum_ch &&
+        (target_core == ASMP_CORE_SUB2_LEAD || target_core == ASMP_CORE_SUB3_BASS) &&
+        r != NULL) {
+        /* 入場整理: 宛先が飽和なら弱音を Core1 で音楽的に間引く。
+         * キュー満杯 (4ms) のランダム落としは「遅れて届いた重要音」を殺し、
+         * しかも Sub1 自体を停滞させて全コアの RENDER_REQ 配送まで遅らせる
+         * 連鎖 (4ms×連打 = 数エポックのジッタ) になる。早期の弱音シェッドは
+         * キューを短く保ち、強音の到達と Sub1 の定時進行を保証する。
+         * vc=14-15 では落とさず thin 化 (unison off) のみで負荷を下げる */
+        uint32_t vc = shared->core[target_core].voice_count;
+        uint32_t busy = shared->core[target_core].render_busy_us;
+        bool hot = (busy > s_current_budget_us);
+        bool hard_full = (vc >= 16u);
+        bool saturated = hard_full || hot;
+        if (saturated && routed.data2 < 64) {
+            shared->diag_queue_drop++;
+            return;
+        }
+        bool thin = saturated || (vc >= 14u);
+        uint8_t prog_eff = r->program_set ? r->program
+            : ((target_core == ASMP_CORE_SUB2_LEAD) ? 0u : 33u);
+        SubSpawnDesc desc;
+        SubSpawnProd *prod;
+        SubSpawnSlot *pool;
+        volatile uint32_t *ack;
+        if (target_core == ASMP_CORE_SUB2_LEAD) {
+            bool gov_off = (shared->main_ctrl.quality_flags & ASMP_QF_UNISON_OFF) != 0;
+            sub_spawn_build_sub2(&desc, routed.channel & 0x0Fu, routed.data1,
+                                 routed.data2, prog_eff, gov_off, thin);
+            prod = &s_spawn_prod2;
+            pool = shared->spawn_pool_sub2;
+            ack = &shared->spawn_ack_sub2.consumed;
+        } else {
+            sub_spawn_build_sub3(&desc, routed.channel & 0x0Fu, routed.data1,
+                                 routed.data2, prog_eff);
+            prod = &s_spawn_prod3;
+            pool = shared->spawn_pool_sub3;
+            ack = &shared->spawn_ack_sub3.consumed;
+        }
+        uint32_t token = 0u;
+        if (sub_spawn_produce(pool, ack, prod, &desc, &token)) {
+            routed.param = token;
         }
     }
 

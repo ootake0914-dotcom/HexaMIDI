@@ -22,6 +22,7 @@
 #endif
 
 #include "sub_common.h"
+#include "sub_spawn.h"
 #include "rt_profile.h"
 #include "spatial_audio.h"
 #include "sub_asm.h" /* M4F手書き UBFX/VFMA カーネル。hostはCフォールバック */
@@ -173,13 +174,8 @@ static void sub2_note_off(Sub2LeadEngine *eng, uint8_t channel, uint8_t note);
 /**
  * @brief ノートオン
  */
-static void sub2_note_on(Sub2LeadEngine *eng, uint8_t channel, uint8_t note, float velocity)
+static int sub2_voice_alloc(Sub2LeadEngine *eng, uint8_t channel, uint8_t note)
 {
-    if (velocity <= 0.0f) {
-        sub2_note_off(eng, channel, note);
-        return;
-    }
-
     int voice_idx = -1;
     /* 1. 同一ノートの再利用 */
     for (int i = 0; i < SUB2_MAX_POLYPHONY; i++) {
@@ -251,11 +247,22 @@ static void sub2_note_on(Sub2LeadEngine *eng, uint8_t channel, uint8_t note, flo
         }
         voice_idx = (quiet_idx >= 0) ? quiet_idx : oldest_idx;
     }
+    return voice_idx;
+}
 
-    VoiceSub2 *v = &eng->voices[voice_idx];
+/**
+ * @brief ディスクリプタからの発音実体化 (ABI v13 fast-spawn)
+ * @details 正準 build の出力 + live 状態 (mod/bendは毎タイル参照) + 乱数位相で
+ *          ボイスを初期化する。係数変換 (exp/tan LUT、premix) のみ演奏コア側で
+ *          行う (LUT は演奏コアにしかないため)。float 式は従来 note-on と同一。
+ */
+static void sub2_spawn_from_desc(Sub2LeadEngine *eng, VoiceSub2 *v, const SubSpawnDesc *d)
+{
+    uint8_t channel = d->channel;
+    float velocity = (float)d->velocity / 127.0f;
     v->active = true;
     v->channel = channel;
-    v->note = note;
+    v->note = d->note;
     v->velocity = velocity;
     v->env.sustained_by_pedal = false;
     v->phase = 0.0f;
@@ -264,89 +271,27 @@ static void sub2_note_on(Sub2LeadEngine *eng, uint8_t channel, uint8_t note, flo
     /* base_increment は必ず「ベンドなし」の値を保存する。
      * レンダーループが毎回 ch->pitch_bend_semitones を掛けるため、
      * ここでベンド込みの値を保存するとベンドが二重適用される */
-    float base_freq = sub_note_to_freq(note);
-    v->frequency = base_freq;
-    v->phase_increment = base_freq / (float)SUB_SAMPLE_RATE;
+    v->frequency = sub_note_to_freq(d->note);
+    v->phase_increment = d->base_increment;
+    v->base_increment = d->base_increment;
 
-    /* GM 音色に応じた設定 */
-    uint8_t prog = eng->channels[channel].program;
-    v->env.adsr.exponential_decay = true;
-
-    if (prog < 8) {
-        /* Acoustic Piano (0-7): 三角波 + パーカッシブADSR */
-        v->wave_type = WAVE2_TRIANGLE;
-        v->env.adsr.attack_time_sec  = 0.003f;
-        v->env.adsr.decay_time_sec   = 0.400f;
-        v->env.adsr.sustain_level    = 0.250f;
-        v->env.adsr.release_time_sec = 0.090f;
-    } else if (prog >= 16 && prog < 24) {
-        /* Organ (16-23): サイン波 + 高サステイン */
-        v->wave_type = WAVE2_SINE;
-        v->env.adsr.attack_time_sec  = 0.010f;
-        v->env.adsr.decay_time_sec   = 0.050f;
-        v->env.adsr.sustain_level    = 0.900f;
-        v->env.adsr.release_time_sec = 0.040f;
-    } else if (prog >= 24 && prog < 32) {
-        /* Guitar (24-31): ノコギリ波 + プラック */
-        v->wave_type = WAVE2_SAWTOOTH;
-        v->env.adsr.attack_time_sec  = 0.002f;
-        v->env.adsr.decay_time_sec   = 0.200f;
-        v->env.adsr.sustain_level    = 0.400f;
-        v->env.adsr.release_time_sec = 0.060f;
-    } else if (prog >= 40 && prog < 48) {
-        /* Strings (40-47): スローアタック */
-        v->wave_type = WAVE2_SAWTOOTH;
-        v->env.adsr.attack_time_sec  = 0.050f;
-        v->env.adsr.decay_time_sec   = 0.100f;
-        v->env.adsr.sustain_level    = 0.850f;
-        v->env.adsr.release_time_sec = 0.120f;
-    } else if (prog >= 56 && prog < 64) {
-        /* Brass (56-63): ノコギリ波 + ブラスアタック */
-        v->wave_type = WAVE2_SAWTOOTH;
-        v->env.adsr.attack_time_sec  = 0.020f;
-        v->env.adsr.decay_time_sec   = 0.080f;
-        v->env.adsr.sustain_level    = 0.800f;
-        v->env.adsr.release_time_sec = 0.060f;
-    } else {
-        /* Lead (80-87) / Synth / Other: 矩形波 / ノコギリ波 */
-        v->wave_type = WAVE2_SQUARE;
-        v->env.adsr.attack_time_sec  = 0.005f;
-        v->env.adsr.decay_time_sec   = 0.080f;
-        v->env.adsr.sustain_level    = 0.650f;
-        v->env.adsr.release_time_sec = 0.050f;
-    }
-
-    /* ユニソン判定: Lead/Synth/Brass 系は 5 オシレータ スーパーソウ
-     * (ガバナーが品質フラグを立てたら自動的に解除) */
-    bool gov_unison_off = (eng->shared->main_ctrl.quality_flags & ASMP_QF_UNISON_OFF) != 0;
-    v->unison = !gov_unison_off &&
-                ((prog >= 56 && prog < 72) || (prog >= 80 && prog < 96));
-
-    /* ウェーブテーブル発音: Lead クラシック 4 波 (80-87) 以外は GM プログラムを
-     * モルフ位置へマップ (Piano=E.Piano / Organ=Drawbar / Bass=Hollow ...) */
-    v->wt_active = (prog < 80);
+    v->wave_type = (WaveType2)d->wave;
+    v->env.adsr.attack_time_sec = d->adsr_a;
+    v->env.adsr.decay_time_sec = d->adsr_d;
+    v->env.adsr.sustain_level = d->adsr_s;
+    v->env.adsr.release_time_sec = d->adsr_r;
+    v->env.adsr.exponential_decay = (d->exp_decay != 0u);
+    v->unison = (d->unison != 0u);
+    v->wt_active = (d->wt_active != 0u);
+    /* wt_morph は note-on 時の morph 解決専用で以降読まないため保持しない */
     if (v->wt_active) {
-        v->wt_morph = subwt_program_to_morph(prog);
-        /* Q32 リーダー用にモルフ両端を note-on 時に確定させる
-         * (毎サンプルの (int) キャスト + 分岐を排除する) */
-        v->morph_a = (uint8_t)v->wt_morph;
-        if (v->morph_a > SUBWT_TABLES - 1u) v->morph_a = SUBWT_TABLES - 1u;
-        float mw = v->wt_morph - (float)v->morph_a;
-        if (mw < 0.0f || v->morph_a >= SUBWT_TABLES - 1u) {
-            mw = 0.0f;                       /* 単表 fast path */
-            v->morph_b = v->morph_a;
-        } else {
-            v->morph_b = v->morph_a + 1u;
-        }
-        v->morph_w = mw;
+        v->morph_a = d->morph_a;
+        v->morph_b = d->morph_b;
+        v->morph_w = d->morph_w;
     }
-    /* ミップ選択: 発音周波数から最高次倍音がエイリアス限界以下の
-     * 最も明るいテーブルを選ぶ (4 段ラダー、全音域エイリアスフリー) */
-    v->wt_mip = subwt_pick_mip(v->frequency);
+    v->wt_mip = d->mip;
 
-    /* モーフ済み単一テーブルを note-on 時に 1 回だけ生成する。
-     * これによりカーネル内のモルフ 2 表読み (osc あたり LUT アクセス倍増)
-     * が単表読みに置き換わり、密集譜面時の S2 ピーク負荷が ~1/3 削される */
+    /* モーフ済み単一テーブルを 1 回だけ生成 (従来と同一。カーネルは単表 fast path) */
     if (v->wt_active) {
         const float (*T)[SUBWT_SIZE + 1] = g_sub_wavbank[v->wt_mip];
         const float *Ta = T[v->morph_a];
@@ -363,16 +308,16 @@ static void sub2_note_on(Sub2LeadEngine *eng, uint8_t channel, uint8_t note, flo
         v->use_premix = false;
     }
 
-    /* Q32 位相/増分の初期化 (ベンド 0、デチューン比適用済みの増分) */
+    /* Q32 位相/増分の初期化 (従来と同一式。plain mult のみで libm 呼びなし) */
     {
-        const float Q32 = 4294967296.0f;             /* 2^32 */
+        const float Q32 = 4294967296.0f;
         float inc0 = v->phase_increment;
         bool hq = (eng->shared->main_ctrl.quality_flags & ASMP_QF_HQ_WIDE) != 0;
         v->qinc[0] = (uint32_t)(inc0 * Q32);
         v->qinc[1] = (uint32_t)(inc0 * SUB2_DETUNE_RATIO_HI  * Q32);
         v->qinc[2] = (uint32_t)(inc0 * SUB2_DETUNE_RATIO_LO  * Q32);
-        v->qinc[3] = (uint32_t)(inc0 * (hq?SUB2_DETUNE_RATIO_HI2_HQ:SUB2_DETUNE_RATIO_HI2) * Q32);
-        v->qinc[4] = (uint32_t)(inc0 * (hq?SUB2_DETUNE_RATIO_LO2_HQ:SUB2_DETUNE_RATIO_LO2) * Q32);
+        v->qinc[3] = (uint32_t)(inc0 * (hq ? SUB2_DETUNE_RATIO_HI2_HQ : SUB2_DETUNE_RATIO_HI2) * Q32);
+        v->qinc[4] = (uint32_t)(inc0 * (hq ? SUB2_DETUNE_RATIO_LO2_HQ : SUB2_DETUNE_RATIO_LO2) * Q32);
         /* 初期位相を LFSR で分散 (全位相 0 の同時スタートは位相干渉で
          * アタックが痩せるため。各オシに独立した乱数位相を与える) */
         uint32_t r = eng->lfsr_state;
@@ -383,55 +328,57 @@ static void sub2_note_on(Sub2LeadEngine *eng, uint8_t channel, uint8_t note, flo
         eng->lfsr_state = r;
     }
 
-    /* フィルタ係数: expf -> LUT 近似 (note-on 時 1 回のみの呼び出し) */
     v->phase2 = v->phase3 = v->phase4 = v->phase5 = 0.0f;
 
     /* 共通 ADSR コアで発音準備 (ATTACK 開始) */
     sub_env_prepare_attack(&v->env);
 
-    /* ---- ペルボイス共振LPF + フィルターエンベロープ (音色別キャラクタ) ---- */
-    float base_hz, peak_add, q;
-    if (prog < 8) {            /* Piano: 柔らかい三角 + 中域ピーク */
-        base_hz = 700.0f;  peak_add = 2200.0f; q = 0.90f;
-    } else if (prog >= 16 && prog < 24) { /* Organ: 明るめ・控えめな倍音制御 */
-        base_hz = 1400.0f; peak_add = 700.0f;  q = 0.70f;
-    } else if (prog >= 24 && prog < 32) { /* Guitar: プラッキーな立ち上がり */
-        base_hz = 900.0f;  peak_add = 3200.0f; q = 1.40f;
-    } else if (prog >= 40 && prog < 48) { /* Strings: 豊かなストレイン */
-        base_hz = 650.0f;  peak_add = 1900.0f; q = 0.85f;
-    } else {                   /* Lead/Synth: アグレッシブなスイープ */
-        base_hz = 1000.0f; peak_add = 3400.0f; q = 1.20f;
-    }
-    /* キートラッキング: 高音ほどフィルタ開度を上げる (4乗根則)。
-     * これがないと高音域のアタックが籠もって輪郭が死ぬ
-     * powf(x,0.25)=sqrt(sqrt(x)): 70cyc->12cyc, note-onバースト12音で~0.7kcyc削減 */
-    {
-        float kt_in = base_freq * (1.0f / 261.6256f);
-        float keytrack = sqrtf(sqrtf(kt_in));
-        if (!(keytrack > 0.55f)) keytrack = 0.55f;   /* NaN/下限ガード */
-        if (keytrack > 2.60f) keytrack = 2.60f;
-        /* ベロシティ -> 基準カットオフ追従 (弱弾きは暗く、強弾きは明るく開く) */
-        float vel_open = 0.70f + 0.55f * velocity;
-        v->filt_cutoff_base = base_hz * vel_open * keytrack;
-        v->filt_peak_hz     = (base_hz + peak_add * (0.35f + 0.65f * velocity)) * keytrack;
-    }
-    v->filt_env         = 1.0f;
-    v->svf_q            = q;   /* タイル毎の係数再計算でも音色別 Q を維持 */
+    /* ペルボイス共振LPF + フィルターエンベロープ (正準値をそのまま使う) */
+    v->filt_cutoff_base = d->filt_base;
+    v->filt_peak_hz = d->filt_peak;
+    v->filt_env = 1.0f;
+    v->svf_q = d->filt_q;   /* タイル毎の係数再計算でも音色別 Q を維持 */
     {
         float tc_samples = SUB2_FILTER_ENV_TIME * (float)SUB_SAMPLE_RATE;
         v->filt_env_coeff = sub_exp_approx(1.0f / tc_samples);
         v->filt_env_coeff64 = sub_exp_approx((float)SUB2_MIX_TILE / tc_samples);
     }
     sub_svf_reset(&v->svf);
-    sub_svf_set(&v->svf, v->filt_peak_hz, q, (float)SUB_SAMPLE_RATE);
+    sub_svf_set(&v->svf, v->filt_peak_hz, d->filt_q, (float)SUB_SAMPLE_RATE);
     /* HP はバス集約へ移行 (per-voice HP 廃止)。ラムブル除去はタイル後段で実施 */
-    v->base_increment = v->phase_increment;
     v->vib_phase = (float)((eng->lfsr_state++ & 0xFFu)) / 256.0f; /* 位相分散 */
     v->vib_inc = (4.6f + 0.8f * ((eng->lfsr_state >> 8) & 0x3u)) / (float)SUB_SAMPLE_RATE;
     v->vib_depth_st = eng->channels[channel].mod_depth * 0.45f;   /* CC#1 最大 ~0.5 半音 */
     v->drift_phase = (float)((eng->lfsr_state++ & 0xFFu)) / 256.0f;
     v->drift_inc = (0.12f + 0.10f * ((eng->lfsr_state >> 4) & 0x3u)) / (float)SUB_SAMPLE_RATE; /* 0.12-0.42Hz */
     spatial_voice_init(&v->spatial);
+}
+
+/**
+ * @brief ディスクリプタ経由のノートオン (Core1分解送信の受け側)
+ */
+static void sub2_note_on_desc(Sub2LeadEngine *eng, const SubSpawnDesc *d)
+{
+    int voice_idx = sub2_voice_alloc(eng, d->channel, d->note);
+    sub2_spawn_from_desc(eng, &eng->voices[voice_idx], d);
+}
+
+/**
+ * @brief ノートオン (従来解釈 = 正準 build 関数に一本化)
+ * @details Core1分解送信とbit一致させるため、解釈は sub_spawn_build_sub2 のみ。
+ *          経路 (desc/従来) によらず同一 program は同一音になる。
+ */
+static void sub2_note_on(Sub2LeadEngine *eng, uint8_t channel, uint8_t note, uint8_t vel)
+{
+    if (vel == 0u) {
+        sub2_note_off(eng, channel, note);
+        return;
+    }
+    int voice_idx = sub2_voice_alloc(eng, channel, note);
+    SubSpawnDesc d;
+    bool gov_off = (eng->shared->main_ctrl.quality_flags & ASMP_QF_UNISON_OFF) != 0;
+    sub_spawn_build_sub2(&d, channel, note, vel, eng->channels[channel].program, gov_off, false);
+    sub2_spawn_from_desc(eng, &eng->voices[voice_idx], &d);
 }
 
 /**
@@ -514,7 +461,34 @@ static void sub2_apply_pending_packet(const AsmpPacket *pkt)
                 if (sub_drum_is_kick(pkt->data1)) sub_kick_note_on(&s_sub2_kick, (float)pkt->data2 / 127.0f);
                 else if (sub_drum_is_metal(pkt->data1)) sub_metal_note_on(&s_sub2_metal, pkt->data1, (float)pkt->data2 / 127.0f);
                 else sub_perc_note_on(&s_sub2_perc, pkt->data1, (float)pkt->data2 / 127.0f);
-            } else if (pkt->channel < 16) sub2_note_on(&s_sub2, pkt->channel, pkt->data1, (float)pkt->data2 / 127.0f);
+            } else if (pkt->channel < 16) {
+                /* ABI v13: Core1分解送信トークンが有効なら fast-spawn。
+                 * 無効 (param=0/陳腐化) なら正準 build で従来解釈する
+                 * (同一関数なので Core1送信とbit一致する) */
+                SubSpawnDesc desc;
+                if (pkt->param != 0u &&
+                    sub_spawn_consume(s_sub2.shared->spawn_pool_sub2,
+                                      &s_sub2.shared->spawn_ack_sub2.consumed,
+                                      pkt->param, &desc)) {
+                    s_sub2.shared->spawn_stats_sub2.fast_spawn++;
+                    asmp_dcache_clean((const void *)&s_sub2.shared->spawn_stats_sub2,
+                                      sizeof(s_sub2.shared->spawn_stats_sub2));
+                    ASMP_BARRIER();
+                    sub2_note_on_desc(&s_sub2, &desc);
+                } else {
+                    s_sub2.shared->spawn_stats_sub2.legacy_spawn++;
+                    asmp_dcache_clean((const void *)&s_sub2.shared->spawn_stats_sub2,
+                                      sizeof(s_sub2.shared->spawn_stats_sub2));
+                    ASMP_BARRIER();
+                    if (pkt->param != 0u) {
+                        /* 陳腐トークンの解放 (スロット再利用のため ack のみ) */
+                        sub_spawn_ack_only(s_sub2.shared->spawn_pool_sub2,
+                                           &s_sub2.shared->spawn_ack_sub2.consumed,
+                                           pkt->param);
+                    }
+                    sub2_note_on(&s_sub2, pkt->channel, pkt->data1, pkt->data2);
+                }
+            }
             break;
         case ASMP_MSG_NOTE_OFF:
             if (pkt->channel != 9 && pkt->channel < 16) sub2_note_off(&s_sub2, pkt->channel, pkt->data1);
@@ -1456,6 +1430,9 @@ static bool sub2_render(Sub2LeadEngine *eng, float *buffer, uint32_t frames, uin
     }
 
     eng->shared->core[ASMP_CORE_SUB2_LEAD].voice_count = active_count;
+    /* Core1入場整理の飽和判定用に公開 (busy_us と同一規律で clean) */
+    asmp_dcache_clean((const void *)&eng->shared->core[ASMP_CORE_SUB2_LEAD].voice_count,
+                      sizeof(eng->shared->core[ASMP_CORE_SUB2_LEAD].voice_count));
     return true;
 }
 
@@ -1527,10 +1504,27 @@ void *subcore2_entry(void *arg)
                             rep = i;
                         }
                     }
-                    if (rep >= 0) s_sub2_pending[rep] = pkt;
+                    if (rep >= 0) {
+                        /* 追い出される NOTE_ON のトークンがあれば解放する
+                         * (descriptor リーク = producer  wedging の防止)。
+                         * [MAX-1] 上書き側は NOTE_ON 不在確定のため不要 */
+                        if (s_sub2_pending[rep].msg_type == ASMP_MSG_NOTE_ON &&
+                            s_sub2_pending[rep].param != 0u) {
+                            sub_spawn_ack_only(shared->spawn_pool_sub2,
+                                               &shared->spawn_ack_sub2.consumed,
+                                               s_sub2_pending[rep].param);
+                        }
+                        s_sub2_pending[rep] = pkt;
+                    }
                     else s_sub2_pending[SUB2_MAX_PENDING - 1] = pkt;
                     shared->diag_queue_drop++;
                 } else {
+                    /* 溢れで捨てる NOTE_ON のトークンも解放する */
+                    if (pkt.msg_type == ASMP_MSG_NOTE_ON && pkt.param != 0u) {
+                        sub_spawn_ack_only(shared->spawn_pool_sub2,
+                                           &shared->spawn_ack_sub2.consumed,
+                                           pkt.param);
+                    }
                     shared->diag_queue_drop++;
                 }
             }
