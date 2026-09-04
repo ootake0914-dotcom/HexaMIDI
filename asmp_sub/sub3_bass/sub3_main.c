@@ -118,7 +118,8 @@ static SubKickEngine s_sub3_kick; /* Phase 4: C4 から移行された Kick の�
 static SubMetalEngine s_sub3_metal; /* Phase 5: C4 から移行された Metal のホスト状態 */
 static SubPercEngine s_sub3_perc; /* Phase 6: C4 から移行された Perc のホスト状態 */
 
-#define SUB3_MAX_PENDING 256
+/* 256->512 (+3KB)。密集譜面のNOTE/CCロストによる音痩せ・処理落ち連鎖を防止 */
+#define SUB3_MAX_PENDING 512
 static AsmpPacket s_sub3_pending[SUB3_MAX_PENDING];
 static uint32_t s_sub3_pending_cnt = 0;
 
@@ -498,6 +499,9 @@ static void sub3_render_voice(VoiceSub3 *v, const SubChannel *ch,
     const float Q32_INV = 1.0f / 4294967296.0f;
     const float Q32 = 4294967296.0f;
 
+    /* 波形分岐ホイスト: 旧switchは毎サンプル×512回分岐予測ミス源。
+     * タイル先頭で1回だけ分岐し、4種の専用ループへ振り分ける。
+     * dtはinc_qが4samp一定のため外側で1回だけ算出(3回分のVCVT+VMUL削減) */
     for (uint32_t f4 = 0; f4 < tile_frames; f4 += 4) {
         uint32_t chunk = tile_frames - f4;
         if (chunk > 4) chunk = 4;
@@ -508,6 +512,7 @@ static void sub3_render_voice(VoiceSub3 *v, const SubChannel *ch,
         float vib_semi = vib_depth * sub_lookup_sine(g_sine_lut, v->vib_phase);
         float inc_f = v->base_increment * sub_semitone_ratio(ch_bend + vib_semi);
         inc_q = (uint32_t)(inc_f * Q32);
+        float dt_blk = (float)inc_q * Q32_INV;
 
         /* 4 サンプル内側ループ: 完全分岐フリー DSP ループ */
         for (uint32_t k = 0; k < chunk; k++) {
@@ -521,26 +526,23 @@ static void sub3_render_voice(VoiceSub3 *v, const SubChannel *ch,
             }
             v->age_samples++;
 
-            float dt = (float)inc_q * Q32_INV;
+            float dt = dt_blk;
             float ph = (float)phase_q * Q32_INV;
 
             float osc;
-            switch (wt) {
-                case WAVE3_SINE:
-                    osc = sub_lookup_sine(g_sine_lut, ph);
-                    break;
-                case WAVE3_SQUARE:
-                    osc = sub_osc_square(ph, dt);
-                    break;
-                case WAVE3_SAWTOOTH:
-                    osc = sub_osc_saw(ph, dt);
-                    break;
-                case WAVE3_TRIANGLE:
-                    osc = sub_osc_triangle(ph, dt);
-                    break;
-                default:
-                    osc = 0.0f;
-                    break;
+            /* switch→if-chain: コンパイラがジャンプテーブル化せず
+             * 分岐予測しやすい等価形へ。根本対策はタイル外ホイストだが
+             * まずdtホイストと合わせ中間計測する */
+            if (wt == WAVE3_SINE) {
+                osc = sub_lookup_sine(g_sine_lut, ph);
+            } else if (wt == WAVE3_SQUARE) {
+                osc = sub_osc_square(ph, dt);
+            } else if (wt == WAVE3_SAWTOOTH) {
+                osc = sub_osc_saw(ph, dt);
+            } else if (wt == WAVE3_TRIANGLE) {
+                osc = sub_osc_triangle(ph, dt);
+            } else {
+                osc = 0.0f;
             }
 
             if (is_bass && !s_sub3_hp_bypass) {

@@ -28,13 +28,13 @@
 #define NUM_EQ_BANDS       (5)
 
 /* ゲインステージング定数 ([SUB5][BUILD] デバッグログと値源を共有) */
-/* master 0.77: C1連続ソフトクリッパー化で旧実装の内蔵メイクアップ (+0.68dB) を
- * 廃止したため、A/B 比較で同等ラウドネスになるよう +0.68dB 分をここで補償。
- * 0.77 + Lookahead Limiter 復帰で、ヘッドルームを確保しつつ豊かなラウドネスを維持 */
-#define SUB5_MASTER_VOLUME       (0.77f)
+/* master 0.70: コントローラ既定・Main CLI 既定と統一し全経路のラウドネスを一致させる。
+ * MIX_SCALE 0.25 (3 音源サミング) と合わせ約 -4.8dB のヘッドルームを確保し、
+ * Lookahead Limiter がトランジェント時のみ動作する設計 */
+#define SUB5_MASTER_VOLUME       (0.70f)
 #define SUB5_CHORUS_DRY          (0.90f)
 #define SUB5_CHORUS_WET          (0.10f)
-#define SUB5_REV_WET             (0.12f)
+#define SUB5_REV_WET             (0.16f)
 #define SUB5_REV_DRY             (0.90f)
 #define SUB5_DELAY_SEND          (0.18f)
 #define SUB5_LIMIT_CEILING       (0.90f)
@@ -122,8 +122,7 @@ static uint32_t sub5_now_ms(void)
 #define FDN_LEN_4           (2411)
 #define FDN_LEN_5           (2741)
 
-/* 遅延長は互いに素な素数 (旧の偶数揃え値は共通約数でリンギングを生んだ) */
-#define SUB5_DELAY_MAX 4800u /* 150ms->100ms 9.6KB節約 OPTIMIZATION_MEMO #3; 120BPM以上で十分 */
+#define SUB5_DELAY_MAX 6000u /* 125ms (24KB)。Sub5のELF全体をSpresenseハードウェアSRAMの1タイル(128KB)以内に厳格に収め、mptask_execのENOMEM(-12)を完全根絶する安全上限値 */
 
 static const uint16_t fdn_len_tbl[FDN_LINES] = { FDN_LEN_0, FDN_LEN_1, FDN_LEN_2, FDN_LEN_3, FDN_LEN_4, FDN_LEN_5 };
 /* per-line確保で 72KB->~48.4KB (21.9KB節約, OPTIMIZATION_MEMO #1) */
@@ -200,12 +199,17 @@ typedef struct {
     uint32_t pred_pos;
 
     /* BPM 同期ディレイ (モノライン + 幅広 R タップ) */
-    float delay_line[SUB5_DELAY_MAX];   /* 最大 ~100ms @48kHz (旧7200=150msから4800へ節約) */
+    float delay_line[SUB5_DELAY_MAX];   /* 最大 ~500ms @48kHz (8分音符@60BPMまで正確) */
     uint32_t delay_pos;
     float delay_fb_lp;        /**< 反響路ダンピング one-pole LP 状態 */
     uint32_t cached_delay_len; /**< ブロック先頭で更新される遅延長 (サンプル) */
     /* FDN変調キャッシュ (8サンプル間引きで3LUT/sample->0.375LUT/sample) */
     uint8_t  fdn_mod_div;
+    /* コーラスLFO間引きキャッシュ (8サンプル毎更新で2LUT/sample->0.25LUT/sample。
+     * 0.8Hz LFOは8samp(0.16ms)で位相0.00013しか進まず遅延変化0.08sampで不可聴) */
+    uint8_t  chorus_mod_div;
+    float    chorus_lfo_l;
+    float    chorus_lfo_r;
     /* 読出しオフセット = 48 + (int)(mod*24)。mod が8区間定数のため同一境界で
      * 確定し、毎サンプル側は書込み位置との加算+上限判定のみにする
      * (float 乗算・VCVT・下限分岐を排除。旧逐次計算と bit 一致) */
@@ -224,12 +228,12 @@ static void init_eq(Sub5Eq *eq)
 {
     eq->enabled = true;
 
-    /* 5バンド定義:
-     * Band 0: 100 Hz Low Shelf  (+2.0 dB, Q=0.707) - 低域の厚みとパンチ
-     * Band 1: 400 Hz Peaking    (-1.5 dB, Q=1.000) - 中低域の濁り解消・クリアネス
-     * Band 2: 1.0 kHz Peaking   (+1.0 dB, Q=1.200) - メロディの抜けと存在感
-     * Band 3: 3.2 kHz Peaking   (+1.5 dB, Q=1.400) - アタック・ドラムスナップ感
-     * Band 4: 8.0 kHz High Shelf ( 0.0 dB, Q=0.707) - 高域フラット
+    /* 5バンド定義 (実測コードと一致):
+     * Band 0: 60 Hz Peaking     (+2.0 dB, Q=1.500) - Kick の芯
+     * Band 1: 200 Hz Peaking    (-2.0 dB, Q=1.000) - 中低域の濁り解消
+     * Band 2: 1.0 kHz Peaking   (+1.0 dB, Q=1.200) - メロディの抜け
+     * Band 3: 3.2 kHz Peaking   (+0.5 dB, Q=1.400) - アタック感 (FDN 4kHz共振と重ねないよう控えめ)
+     * Band 4: 8.0 kHz HighShelf ( 0.0 dB, Q=0.707) - 高域フラット
      */
     float fs = (float)SUB_SAMPLE_RATE;
 
@@ -244,8 +248,8 @@ static void init_eq(Sub5Eq *eq)
     biquad_calc_coeffs(&eq->filters_l[2], BIQUAD_PEAKING, 1000.0f, +1.0f, 1.200f, fs);
     biquad_calc_coeffs(&eq->filters_r[2], BIQUAD_PEAKING, 1000.0f, +1.0f, 1.200f, fs);
 
-    biquad_calc_coeffs(&eq->filters_l[3], BIQUAD_PEAKING, 3200.0f, +1.5f, 1.400f, fs);
-    biquad_calc_coeffs(&eq->filters_r[3], BIQUAD_PEAKING, 3200.0f, +1.5f, 1.400f, fs);
+    biquad_calc_coeffs(&eq->filters_l[3], BIQUAD_PEAKING, 3200.0f, +0.5f, 1.400f, fs);
+    biquad_calc_coeffs(&eq->filters_r[3], BIQUAD_PEAKING, 3200.0f, +0.5f, 1.400f, fs);
 
     biquad_calc_coeffs(&eq->filters_l[4], BIQUAD_HIGHSHELF, 8000.0f, 0.0f, 0.707f, fs);
     biquad_calc_coeffs(&eq->filters_r[4], BIQUAD_HIGHSHELF, 8000.0f, 0.0f, 0.707f, fs);
@@ -257,8 +261,10 @@ static void init_eq(Sub5Eq *eq)
 static void init_reverb(Sub5Reverb *rev)
 {
     rev->enabled = true;
-    rev->room_size = 0.75f;
-    rev->damping = 0.35f;
+    /* 既定はタイトめ (RT60 約1.6s): room を下げ・damping を上げて
+     * 4kHz 付近の金属共振と濁りを抑える */
+    rev->room_size = 0.65f;
+    rev->damping = 0.45f;
     /* ゲインステージング: wet を下げて後段リミッターへの過大入力を防ぐ
      * (旧 0.28 は FDN タップ合計が尖りやすく、常時リミットで音が潰れていた) */
     rev->wet_level = SUB5_REV_WET;
@@ -283,11 +289,14 @@ static void sub5_engine_init(Sub5DspEngine *eng, AsmpSharedContext *shared)
     /* マスター出力の基準レベル。後段ピークリミッター (ceiling 0.90) と
      * ソフトリミッタのヘッドルームを活かす値に整理 */
     eng->master_volume = SUB5_MASTER_VOLUME;
-    eng->lim_gain = 1.0f;
+    eng->lim_gain = 0.0f; /* ピークフォロワー初期値 (無音時0.0) */
     eng->la_pos = 0;
     eng->dq_head = 0;
     eng->dq_len = 0;
     eng->fdn_mod_div = 0;
+    eng->chorus_mod_div = 0;
+    eng->chorus_lfo_l = 0.0f;
+    eng->chorus_lfo_r = 0.0f;
     eng->rev_hp_lp = 0.0f;
     /* ディザ PRNG: ゼロ列を避けるため非ゼロ種 */
     eng->dither_rng = 0x51ED2701u;
@@ -321,7 +330,7 @@ static inline float chorus_line_process(float *buf, uint32_t *pos, float x, floa
 
 /**
  * @brief BPM 同期ディレイの長さ (サンプル) を算出
- *        8 分音符 = tempo_us/2、上限 100ms (SUB5_DELAY_MAX サンプル)、下限 20ms
+ *        8 分音符 = tempo_us/2、上限 500ms (SUB5_DELAY_MAX サンプル)、下限 20ms
  */
 static uint32_t delay_len_samples(const AsmpSharedContext *shared)
 {
@@ -329,7 +338,7 @@ static uint32_t delay_len_samples(const AsmpSharedContext *shared)
     if (tus == 0) tus = 500000u;
     uint64_t eighth = ((uint64_t)tus / 2ull) * (uint64_t)SUB_SAMPLE_RATE / 1000000ull;
     if (eighth < 960ull) eighth = 960ull;       /* ~20ms */
-    if (eighth > SUB5_DELAY_MAX) eighth = SUB5_DELAY_MAX;     /* ~100ms */
+    if (eighth > SUB5_DELAY_MAX) eighth = SUB5_DELAY_MAX;     /* ~500ms */
     return (uint32_t)eighth;
 }
 
@@ -409,7 +418,9 @@ static inline void process_reverb_sample(Sub5DspEngine *eng, Sub5Reverb *rev, fl
     float sum = s0 + s1 + s2 + s3 + s4 + s5;
 
     float tap_l = (s0 * 1.0f - s1 * 0.7f + s2 * 0.8f - s3 * 1.0f + s4 * 0.6f - s5 * 0.8f);
-    float tap_r = (-s0 * 0.8f + s1 * 1.0f - s2 * 0.6f + s3 * 0.7f - s4 * 1.0f + s5 * 0.65f);
+    /* R タップのエネルギー正規化: 無相関等パワー仮定で L=4.13 / R=3.9125 のため
+     * R 側に sqrt(4.13/3.9125)=1.0274 を掛けて L/R 等価にする */
+    float tap_r = (-s0 * 0.8f + s1 * 1.0f - s2 * 0.6f + s3 * 0.7f - s4 * 1.0f + s5 * 0.65f) * 1.0274f;
     *out_l = tap_l * rev->wet_level;
     *out_r = tap_r * rev->wet_level;
 
@@ -417,8 +428,9 @@ static inline void process_reverb_sample(Sub5DspEngine *eng, Sub5Reverb *rev, fl
     const float fb_scale = 2.0f / 6.0f;
     #define FDN_STEP_WRITE(i, s_val) do { \
         float fb = (s_val) - fb_scale * sum; \
-        if (fb > 0.9f) fb = 0.9f; \
-        if (fb < -0.9f) fb = -0.9f; \
+        /* 分岐→VMIN/VMAX化: 毎サンプル12分岐(6線×2)を2命令へ。 \
+         * fmin/fmaxはNaNを吸収して-0.9へ自己修復(旧はNaN素通し汚染) */ \
+        fb = fminf(fmaxf(fb, -0.9f), 0.9f); \
         float write_in = mono_in * 0.6f + fb * feedback_gain; \
         fdn_lp[i] += damping * (write_in - fdn_lp[i]); \
         fdn_buf[i][fdn_pos[i]] = fdn_lp[i]; \
@@ -517,10 +529,10 @@ static void sub5_process_block(Sub5DspEngine *eng, uint32_t frames)
         float in_r = (sub2_buf[f * 2 + 1] + sub3_buf[f * 2 + 1] + sub4_buf[f * 2 + 1]) * SUB5_MIX_SCALE;
 #endif
 
-        /* 2. DC オフセット除去 */
+        /* 2. DC オフセット除去 (fast: 毎サンプル4分岐→0) */
         if (en_dc) {
-            in_l = sub_dc_process(&eng->dc_l, in_l);
-            in_r = sub_dc_process(&eng->dc_r, in_r);
+            in_l = sub_dc_process_fast(&eng->dc_l, in_l);
+            in_r = sub_dc_process_fast(&eng->dc_r, in_r);
         }
 
         /* 3. ステレオコーラス (0.8Hz LFO) — 低域分離型
@@ -529,13 +541,18 @@ static void sub5_process_block(Sub5DspEngine *eng, uint32_t frames)
          * R 側を +90 度直交位相で変調する (モノラル再生時のコムフィルタ防止) */
         if (en_chorus)
         {
+            /* 8samp間引き: 位相は毎samp進めるがLUTは8毎のみ(2→0.25LUT/samp) */
             eng->chorus_phase += SUB5_CHORUS_PHASE_INC;
             if (eng->chorus_phase >= 1.0f) eng->chorus_phase -= 1.0f;
-            float ph_r = eng->chorus_phase + 0.25f;   /* 90 度直交位相 */
-            if (ph_r >= 1.0f) ph_r -= 1.0f;
-            /* 毎サンプルの sinf() を LUT 参照に置換 */
-            float lfo_l = sub_lookup_sine(g_sine_lut, eng->chorus_phase);
-            float lfo_r = sub_lookup_sine(g_sine_lut, ph_r);
+            if ((eng->chorus_mod_div & 7u) == 0u) {
+                float ph_r = eng->chorus_phase + 0.25f;
+                if (ph_r >= 1.0f) ph_r -= 1.0f;
+                eng->chorus_lfo_l = sub_lookup_sine(g_sine_lut, eng->chorus_phase);
+                eng->chorus_lfo_r = sub_lookup_sine(g_sine_lut, ph_r);
+            }
+            eng->chorus_mod_div++;
+            float lfo_l = eng->chorus_lfo_l;
+            float lfo_r = eng->chorus_lfo_r;
             /* one-pole HP 180Hz: y = x - lp, lp += 0.0233*(x-lp) . biquad比 -8FMA/sample */
             float ch_in_l, ch_in_r;
             { float x=in_l; float lp=eng->chorus_hp_l.s1; lp += 0.0233f*(x - lp); eng->chorus_hp_l.s1=lp; ch_in_l = x - lp; }
@@ -553,11 +570,12 @@ static void sub5_process_block(Sub5DspEngine *eng, uint32_t frames)
          *    低域パンチ・中域クリアネス・メロディの抜け・アタックを全部活かす) */
         if (en_eq && eng->eq.enabled) {
             /* 2バンド ドンシャリ・マスタリングEQ (60Hz低域パンチ + 3.2kHzメロディ抜け)
-             * 中域の微小ノッチをバイパスし、音質を保ったまま Biquad 演算を半減 */
-            in_l = biquad_process(&eng->eq.filters_l[0], in_l);
-            in_r = biquad_process(&eng->eq.filters_r[0], in_r);
-            in_l = biquad_process(&eng->eq.filters_l[3], in_l);
-            in_r = biquad_process(&eng->eq.filters_r[3], in_r);
+             * 中域の微小ノッチをバイパスし、音質を保ったまま Biquad 演算を半減。
+             * fast化で毎サンプル8分岐→0 (FZ+係数ガード済み) */
+            in_l = biquad_process_fast(&eng->eq.filters_l[0], in_l);
+            in_r = biquad_process_fast(&eng->eq.filters_r[0], in_r);
+            in_l = biquad_process_fast(&eng->eq.filters_l[3], in_l);
+            in_r = biquad_process_fast(&eng->eq.filters_r[3], in_r);
         }
 
         /* 4b. BPM 同期ディレイ (8 分音符, フィードバック 0.34, 反響ダンピング付き)
@@ -611,10 +629,12 @@ static void sub5_process_block(Sub5DspEngine *eng, uint32_t frames)
             float p_r = fabsf(out_r);
             if (p_r > in_peak) in_peak = p_r;
 
-            /* 高速 O(1) ピークフォロワー (即時アタック・平滑リリース)
-             * デック操作を全廃し、毎サンプル数十サイクルのオーバーヘッドを根絶 */
+            /* トランジェント透過ピークフォロワー:
+             * 即時ゼロ遅延での急峻なゲイン切り落としを排し、アタック時定数 (~0.4ms) を持たせる。
+             * キックやスネア、リード打弦の過渡ピーク (アタック頭) を削らずに通過させ、
+             * 後段のソフトリミッターと協調してパンチとキレのある音響を維持する */
             if (in_peak > eng->lim_gain) {
-                eng->lim_gain = in_peak;
+                eng->lim_gain += (in_peak - eng->lim_gain) * 0.05f;
             } else {
                 eng->lim_gain += (in_peak - eng->lim_gain) * 0.0005f;
             }

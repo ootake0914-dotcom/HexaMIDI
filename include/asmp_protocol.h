@@ -43,8 +43,9 @@ extern "C" {
 /* 実機ログに旧タグが出た場合は romfs 埋め込み ELF が古い (=再ビルド漏れ)     */
 /* ※ #define のみで構造体レイアウトには影響しない (バイナリ互換性維持)        */
 /* ========================================================================= */
-/* [dsp-20260903-p0c] P0-C Render Mailbox & Non-Droppable Control Plane */
-#define HEXASENSE_DSP_TAG "dsp-20260903-q512-spawn"
+/* [dsp-20260905-tune1] Full Tune: gain unify 0.70, host soft-limit+DC, GM holes,
+ * reverb room/damp/wet, EQ 3.2k, FDN tap norm, steal fade, kick click, Sub2 8/6 hyst */
+#define HEXASENSE_DSP_TAG "dsp-20260905-tune1"
 
 /* ABI whiskey (S1) - 共有コンテキストのレイアウト不一致を起動時に検出 */
 #define ASMP_PROTOCOL_MAGIC   0x48535836u /* "H" "S" "X" "6" */

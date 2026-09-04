@@ -34,7 +34,7 @@ static void test_adsr_sustain_zero(void)
     engine.default_adsr.sustain_level = 0.0f;
     engine.default_adsr.release_time_sec = 0.020f;
 
-    /* プログラム0 (Piano) の実際のエンベロープ: A=3ms D=350ms S=0.30 R=80ms
+    /* プログラム0 (Piano) の実際のエンベロープ: A=3ms D=350ms S=0.25 R=80ms
      * (channel_note_on はプログラム別 ADSR を適用するため default_adsr は参考値) */
     int v_idx = synth_engine_note_on(&engine, 60, 1.0f, WAVE_SINE);
     assert(v_idx >= 0);
@@ -608,7 +608,7 @@ static void test_exponential_adsr_curve(void)
     engine.default_adsr.release_time_sec = 0.050f;
     engine.default_adsr.exponential_decay = true;
 
-    /* プログラム0 Piano の実エンベロープ: A=3ms D=350ms S=0.30 R=80ms */
+    /* プログラム0 Piano の実エンベロープ: A=3ms D=350ms S=0.25 R=80ms (Sub2/Sub3 spawn と統一) */
     int v = synth_engine_note_on(&engine, 60, 1.0f, WAVE_SINE);
     int16_t buf[(4096 + 512) * 2];
 
@@ -617,15 +617,15 @@ static void test_exponential_adsr_curve(void)
 
     synth_engine_render(&engine, buf, 1200);
     float mid_decay_level = engine.voices[v].current_env_level;
-    printf("  -> Exponential mid-decay level: %.4f (Sustain target: 0.3000)\n", mid_decay_level);
-    assert(mid_decay_level > 0.30f && mid_decay_level <= 1.0f);
+    printf("  -> Exponential mid-decay level: %.4f (Sustain target: 0.2500)\n", mid_decay_level);
+    assert(mid_decay_level > 0.25f && mid_decay_level <= 1.0f);
 
     /* ディケイ完了 (~352ms) までレンダリングしてサステイン到達を確認 */
     for (int i = 0; i < 6; i++) {
         synth_engine_render(&engine, buf, 4096);
     }
     assert(engine.voices[v].env_state == ENV_SUSTAIN);
-    assert(fabsf(engine.voices[v].current_env_level - 0.30f) < 0.01f);
+    assert(fabsf(engine.voices[v].current_env_level - 0.25f) < 0.01f);
 
     synth_engine_note_off(&engine, 60);
     assert(engine.voices[v].env_state == ENV_RELEASE);
@@ -756,10 +756,13 @@ static void test_16ch_multitimbral_and_cc(void)
         right_energy += abs(buf[i * 2 + 1]);
     }
     printf("  -> Pan Left: Left Energy=%d, Right Energy=%d\n", left_energy, right_energy);
-    assert(left_energy > 1000 && right_energy == 0);
+    /* 消音側は DC ブロッカ残留 + TPDF ディザ (±1 LSB) のみ許容 (reverb テストと同一思想) */
+    assert(left_energy > 1000 && right_energy <= 256);
 
-    /* Pan Hard Right (127) */
+    /* Pan Hard Right (127): DC ブロッカのステップ応答 (~9k samples で完全収束) を
+     * セトルさせてから測定する。収束後は exact zero に戻ることを検証する */
     synth_engine_control_change(&engine, 0, 10, 127);
+    for (int i = 0; i < 64; i++) synth_engine_render(&engine, buf, 256);
     synth_engine_render(&engine, buf, 256);
     left_energy = 0; right_energy = 0;
     for (int i = 0; i < 256; i++) {
@@ -772,6 +775,7 @@ static void test_16ch_multitimbral_and_cc(void)
     /* 3. CC#7 (Volume) テスト */
     synth_engine_control_change(&engine, 0, 10, 64); /* Center */
     synth_engine_control_change(&engine, 0, 7, 0);    /* Volume 0 */
+    for (int i = 0; i < 64; i++) synth_engine_render(&engine, buf, 256);
     synth_engine_render(&engine, buf, 256);
     int32_t vol0_energy = 0;
     for (int i = 0; i < 256; i++) {

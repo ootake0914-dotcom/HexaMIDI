@@ -36,25 +36,17 @@ static inline float generate_noise_xor(uint32_t *s){ return generate_noise_lfsr(
 
 static inline float lookup_sine(const float *lut, float phase)
 {
-    /* floorf排除版: sub_common.h:sub_lookup_sineと同一のint cast+mask方式 */
+    /* 線形補間 + 単一FMA (sub_common.h:sub_lookup_sineと同一)。
+     * 旧3次Hermite (~15flop) は誤差3.7e-9(-168dB)と過剰で、
+     * 16bitフロア(-96dB)に対し線形の4.7e-6(-106dB)で十分。
+     * M4FではHermite 15cyc→FMA 2cyc、hostでもsinf並から最速化 */
     float pos = phase * (float)SYNTH_SINE_LUT_SIZE;
     int idx = (int)pos;
     if (pos < 0.0f && idx != pos) idx--; /* floor */
-    int im = (idx - 1) & (SYNTH_SINE_LUT_SIZE - 1);
     int i0 = idx & (SYNTH_SINE_LUT_SIZE - 1);
     int i1 = (idx + 1) & (SYNTH_SINE_LUT_SIZE - 1);
-    int i2 = (idx + 2) & (SYNTH_SINE_LUT_SIZE - 1);
     float frac = pos - (float)idx;
-    /* 3次 Hermite 補間 (sub_common.h と同一実装): 誤差 ~3.7e-9 */
-    float m0 = 0.5f * (lut[i1] - lut[im]);
-    float m1 = 0.5f * (lut[i2] - lut[i0]);
-    float t = frac;
-    float t2 = t * t;
-    float t3 = t2 * t;
-    return (2.0f*t3 - 3.0f*t2 + 1.0f) * lut[i0]
-         + (t3 - 2.0f*t2 + t)       * m0
-         + (-2.0f*t3 + 3.0f*t2)     * lut[i1]
-         + (t3 - t2)                * m1;
+    return fmaf(lut[i1] - lut[i0], frac, lut[i0]);
 }
 
 /* ========================================================================= */
@@ -186,8 +178,8 @@ static void init_reverb(SynthEngine *eng)
 {
     ReverbEffect *rev = &eng->reverb;
     rev->enabled = false;
-    rev->room_size = 0.75f;
-    rev->damping = 0.35f;
+    rev->room_size = 0.65f;
+    rev->damping = 0.45f;
     rev->wet_level = 0.30f;
     /* synth_engine_set_reverb と同一式 (dry = 1 - wet*0.3) */
     rev->dry_level = 1.0f - (rev->wet_level * 0.3f);
@@ -346,6 +338,10 @@ static void engine_update_pan_gains(SynthEngine *engine, uint8_t channel)
     float pan = engine->channels[channel].pan;
     if (!(pan >= 0.0f)) pan = 0.0f;   /* NaN/負値ガード */
     if (pan > 1.0f) pan = 1.0f;
+    /* 端点スナップ: cos(pi/2)=6e-08の漏れ(-144dB)が新ディザ閾値で
+     * 可聴ヒス化するため、Hard L/Rは厳密0/1へ (等価パワー不変) */
+    if (pan <= 0.0f) { engine->ch_pan_cos[channel] = 1.0f; engine->ch_pan_sin[channel] = 0.0f; return; }
+    if (pan >= 1.0f) { engine->ch_pan_cos[channel] = 0.0f; engine->ch_pan_sin[channel] = 1.0f; return; }
     float ang = pan * ((float)M_PI * 0.5f);
     engine->ch_pan_cos[channel] = cosf(ang);
     engine->ch_pan_sin[channel] = sinf(ang);
@@ -536,8 +532,8 @@ void synth_engine_retune_voice(SynthEngine *engine, uint8_t channel, uint8_t old
 /**
  * @brief GM プログラム群 -> 基本音色 (波形 + ADSR) マッピング表
  *        先頭から順に判定し、最初に一致した [prog_start, prog_end) を適用する。
- *        ※ 意図的な穴: 8-15 / 48-55 は最終の Default (Lead 系) へ落ちる
- *          (旧 if-else ラダーと同じ挙動を保持)
+ *        全 128 プログラムを網羅する (穴なし)。Piano 系 S=0.25 は
+ *        Sub2/Sub3 spawn と統一した値
  */
 typedef struct {
     uint8_t  prog_start;    /**< 適用開始プログラム (含む) */
@@ -551,11 +547,13 @@ typedef struct {
 
 static const GmTimbreEntry s_gm_timbre_table[] = {
     /*  範囲      波形              A       D       S       R   */
-    {   0,   8, WAVE_TRIANGLE, 0.003f, 0.350f, 0.300f, 0.080f }, /* Piano: パーカッシブなディケイ */
+    {   0,   8, WAVE_TRIANGLE, 0.003f, 0.350f, 0.250f, 0.080f }, /* Piano: パーカッシブなディケイ */
+    {   8,  16, WAVE_TRIANGLE, 0.003f, 0.300f, 0.250f, 0.080f }, /* Chromatic Perc: 鐘系パーカッシブ */
     {  16,  24, WAVE_SINE,     0.010f, 0.050f, 0.900f, 0.040f }, /* Organ: サイン波 + 高サステイン */
     {  24,  32, WAVE_SAWTOOTH, 0.002f, 0.200f, 0.400f, 0.060f }, /* Guitar: ノコギリ + プラック */
     {  32,  40, WAVE_SQUARE,   0.003f, 0.150f, 0.700f, 0.050f }, /* Bass: 矩形波 + ファットなアタック */
     {  40,  48, WAVE_SAWTOOTH, 0.050f, 0.100f, 0.850f, 0.120f }, /* Strings: スロー攻撃 & 豊潤サステイン */
+    {  48,  56, WAVE_SAWTOOTH, 0.040f, 0.120f, 0.800f, 0.120f }, /* Ensemble: ストリングス寄り */
     {  56,  64, WAVE_SAWTOOTH, 0.020f, 0.080f, 0.800f, 0.060f }, /* Brass: ブラスアタック */
     {   0, 128, WAVE_SQUARE,   0.005f, 0.080f, 0.600f, 0.050f }, /* Default: Lead/Synth/Other */
 };
@@ -777,11 +775,12 @@ int synth_engine_channel_note_on(SynthEngine *engine, uint8_t channel, uint8_t n
     v->release_start_level = 0.0f;
     v->release_step = 0.0f;
     v->release_coeff = 0.0f;
-    /* スチール/再トリガ元のエンベロープレベルを引き継ぐ。
-     * 旧実装のハードリセット (=0) は直前サンプルとのフルスケール段差を
-     * 生み出しクリックの原因だった。振幅を連続させたままアタックへ移行する
-     * ただし低音の同音連打ではドローン化するため low_hard時は0リセット */
-    if (low_hard) {
+    /* スチール時のレベル処理:
+     * 別音程へのスチール (=位相リセット) ではレベルを 0 に戻し、アタックランプ
+     * (1〜8ms) をフェードインとして使う。レベル引継ぎは波形値が跳ぶため
+     * 0.22 級のクリック源だった。同音再利用 (位相連続) のみ引継ぐ。
+     * 低音連打のドローン化も low_hard で 0 リセットする */
+    if (!same_note_reuse || low_hard) {
         v->current_env_level = 0.0f;
     } else if (!(v->current_env_level >= 0.0f) || v->current_env_level > 1.0f) {
         v->current_env_level = 0.0f; /* NaN/異常値ガード */
@@ -982,6 +981,8 @@ void synth_engine_reset_effects(SynthEngine *engine)
             engine->reverb.allpass_r[i].buf_idx = 0;
         }
     }
+    engine->dc_x1_l = engine->dc_y1_l = 0.0f;
+    engine->dc_x1_r = engine->dc_y1_r = 0.0f;
 }
 
 static inline float update_envelope(SynthVoice *v)
@@ -1061,6 +1062,17 @@ static inline float update_envelope(SynthVoice *v)
     return v->current_env_level;
 }
 
+/* ミックスバス DC ブロッカー (r=0.995 @48kHz。Sub5 と同一特性)。
+ * 出力段で低域うねりを除去する。デノーマル沈み込み防止に 1e-20 flush */
+static inline float engine_dc_block(float x, float *x1, float *y1)
+{
+    float y = x - *x1 + 0.995f * (*y1);
+    if (fabsf(y) < 1e-20f) y = 0.0f;
+    *x1 = x;
+    *y1 = y;
+    return y;
+}
+
 /* float [-1,1] -> int16 (対称丸め)。
  * 単純切り捨ては負側に -0.5LSB の DC バイアスを作るため
  * 0 から遠ざかる方向へ 0.5 を足してから切る (half away from zero) */
@@ -1070,6 +1082,23 @@ static inline int16_t sat_s16_round(float x)
     if (x > 32767.0f)  x = 32767.0f;
     if (x < -32768.0f) x = -32768.0f;
     return (int16_t)x;
+}
+
+/* ソフトサチュレーション (C1 連続: 値・傾きとも連続。Sub5 と同一特性)。
+ * 線形域 (|x| <= 0.85) -> 3 次ショルダー -> フラット天井 (|x| >= 1.30)。
+ * 旧ハードクランプは高調波の角が立って濁るため廃止 */
+static inline float engine_soft_limit(float x)
+{
+    if (!SUB_ISFINITE_F(x)) return 0.0f;
+    const float a = 0.85f;
+    float ax = fabsf(x);
+    if (ax <= a) return x;
+    if (ax >= 1.30f) return (x > 0.0f) ? 1.0f : -1.0f;
+    const float w_inv  = 2.2222222f;   /* 1 / w    (w = 0.45) */
+    const float w3_inv = 1.6460905f;   /* 1 / (3w^2)          */
+    float u = ax - a;
+    float m = u - u * u * w_inv + u * u * u * w3_inv;
+    return (x > 0.0f) ? (a + m) : -(a + m);
 }
 
 void synth_engine_render(SynthEngine *engine, int16_t *buffer, uint32_t frames)
@@ -1167,13 +1196,11 @@ void synth_engine_render(SynthEngine *engine, int16_t *buffer, uint32_t frames)
             out_r = dry_r * engine->reverb.dry_level + rev_out_r;
         }
 
-        /* ソフトクリッパ: |x|<=1 は線形、|x|>1 は単調クランプ。
-         * (旧 3x-x^3/2 多項式は x>1 で非単調かつ x=1.5 で 0.56->1.0 の不連続ジャンプ =
-         *  クリックノイズを生成するため廃止。x=1 で値連続を保証) */
-        if (out_l > 1.0f)  out_l = 1.0f;
-        if (out_l < -1.0f) out_l = -1.0f;
-        if (out_r > 1.0f)  out_r = 1.0f;
-        if (out_r < -1.0f) out_r = -1.0f;
+        /* ソフトサチュレーション (C1 連続。ハードクランプ廃止) */
+        out_l = engine_dc_block(out_l, &engine->dc_x1_l, &engine->dc_y1_l);
+        out_r = engine_dc_block(out_r, &engine->dc_x1_r, &engine->dc_y1_r);
+        out_l = engine_soft_limit(out_l);
+        out_r = engine_soft_limit(out_r);
 
         /* TPDF ディザ付き 16bit 量子化 (SubCore 5 と同一の量子化ポリシー) */
         buffer[i * 2 + 0] = sub_quantize_dither(out_l, &engine->dither_rng);
@@ -1198,10 +1225,10 @@ void synth_engine_render_impulse_response(SynthEngine *engine, int16_t *buffer, 
             out_r = input * engine->reverb.dry_level + rev_out_r;
         }
 
-        if (out_l > 1.0f) out_l = 1.0f;
-        if (out_l < -1.0f) out_l = -1.0f;
-        if (out_r > 1.0f) out_r = 1.0f;
-        if (out_r < -1.0f) out_r = -1.0f;
+        out_l = engine_dc_block(out_l, &engine->dc_x1_l, &engine->dc_y1_l);
+        out_r = engine_dc_block(out_r, &engine->dc_x1_r, &engine->dc_y1_r);
+        out_l = engine_soft_limit(out_l);
+        out_r = engine_soft_limit(out_r);
 
         buffer[i * 2 + 0] = sub_quantize_dither(out_l, &engine->dither_rng);
         buffer[i * 2 + 1] = sub_quantize_dither(out_r, &engine->dither_rng);

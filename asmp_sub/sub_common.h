@@ -83,7 +83,12 @@ static inline bool sub_isfinite_f(float x)
 
 static inline int16_t sub_quantize_dither(float x, uint32_t *rng)
 {
-    if (!sub_isfinite_f(x) || fabsf(x) < 0.0001f) return 0;
+    /* 音質修正: 旧fabsf<0.0001(-80dB)ゲートはリバーブ尾(-80〜-96dB)を
+     * 早期切断しTPDFの意味を消していた。デノーマル flush のみ(1e-20)に
+     * 緩和し、真の無音(x==0)は分岐なしで自然に0+ディザ±1LSB→丸めで0へ。
+     * 低レベル(-96dB)までディザで滑らかに減衰する */
+    if (!sub_isfinite_f(x)) return 0;
+    if (fabsf(x) < 1e-20f) return 0;
     if (x > 1.0f) x = 1.0f;
     if (x < -1.0f) x = -1.0f;
     /* P9改善: 2回 xorshift(各3xor+2shift= ~12c)を1回に半減。
@@ -420,6 +425,17 @@ static inline float biquad_process(BiquadFilter *f, float in)
     return out;
 }
 
+/* ホットパス専用チェックレス版 (Sub5毎サンプル8回→0分岐)。
+ * FZ+DN有効 + 係数init時ガード済みのためNaN混入は構造的に起きない。
+ * 万一NaNが入っても次ブロック先頭のDC/係数チェックで復帰する */
+static inline float biquad_process_fast(BiquadFilter *f, float in)
+{
+    float out = fmaf(in, f->b0, f->s1);
+    f->s1 = fmaf(in, f->b1, f->s2) - f->a1 * out;
+    f->s2 = in * f->b2 - f->a2 * out;
+    return out;
+}
+
 /**
  * @brief Cortex-M4F FPU デノーマル対策: Flush-to-Zero (FZ) + Default NaN (DN)
  * @details 全ワーカーコアで呼び出すこと。FZ 無効のままリリース尾やフィルタ
@@ -476,8 +492,10 @@ static inline void sub_svf_reset(SubSvf *f)
  *  - ワーカーはコア毎に独立リンクされるため、static テーブルはコア単位で
  *    一つずつ存在する (シングルスレッド前提のためロック不要)               */
 
-/* ---- expf(-x) 近似: 256 要素 + 線形補間 (x ∈ [0,16], -80dB 打ち切り) ---- */
-#define SUB_EXP_LUT_SIZE  (256)
+/* ---- expf(-x) 近似: 512 要素 + 線形補間 (x ∈ [0,16], -80dB 打ち切り) ----
+ * 256->512 (+1KB/ワーカー)。ADSR/スイープ係数の補間誤差を半減し、
+ * 参照コストは同一 (FMA 1回)。メモリで音質を買う */
+#define SUB_EXP_LUT_SIZE  (512)
 #define SUB_EXP_LUT_SPAN  (16.0f)
 #ifndef SUB_COMMON_NO_LUT
 static float s_sub_exp_lut[SUB_EXP_LUT_SIZE + 1];
@@ -668,6 +686,17 @@ static inline void sub_dc_reset(SubDcBlocker *d, float r)
     d->r = r;
 }
 
+static inline float sub_dc_process_fast(SubDcBlocker *d, float x)
+{
+    /* ホットパス専用: isfinite 2回→0分岐。FZ+DNでデノーマルHW flush、
+     * 入力は sub2/3/4 バス(有限保証)のみのためチェック不要 */
+    float y = x - d->x1 + d->r * d->y1;
+    if (fabsf(y) < 1e-20f) y = 0.0f;
+    d->x1 = x;
+    d->y1 = y;
+    return y;
+}
+
 static inline float sub_dc_process(SubDcBlocker *d, float x)
 {
     if (!sub_isfinite_f(x)) {
@@ -764,7 +793,9 @@ typedef struct {
 /* 5e. ウェーブテーブル・オシレータ (8テーブル×6ミップ, モルフォ対応)          */
 /* ========================================================================= */
 #define SUBWT_TABLES  (8)
-#define SUBWT_SIZE    (128)
+/* 128->256 (+24.6KB Flash ROM、+8KB Sub2 premix BSS)。WT補間刻み半減で
+ * 高域のざらつき・ユニゾンうなり質感が向上。演算数は同一のためCPU不変 */
+#define SUBWT_SIZE    (256)
 #define SUBWT_MIPS    (6)
 
 typedef struct {
@@ -887,19 +918,19 @@ static inline float subwt_read(const SubWavBank *bank, float morph, int mip, flo
  *
  * float 位相方式の「加算 -> 1.0 比較分岐 -> int 変換」を排除し、
  * インデックス抽出をシフト 1 命令 (+小数部マスク) で行う。
- * SUBWT_SIZE==128 前提: 上位 7bit=bin, 続く 7bit=補間係数
- */
-#if SUBWT_SIZE != 128
-#error "subwt_read_q32 は SUBWT_SIZE == 128 前提のビット配置です"
+ * SUBWT_SIZE==256 前提: 上位 8bit=bin, 下位24bit=補間係数
+  */
+#if SUBWT_SIZE != 256
+#error "subwt_read_q32 は SUBWT_SIZE == 256 前提のビット配置です"
 #endif
 static inline float subwt_read_q32(const SubWavBank *bank, int mip,
                                    uint32_t ta, uint32_t tb, float tw, uint32_t ph)
 {
     const float (*T)[SUBWT_SIZE + 1] = bank->table[mip];
-    uint32_t i0 = ph >> 25;                       /* 上位 7bit -> bin [0,127] */
+    uint32_t i0 = ph >> 24;                       /* 上位 8bit -> bin [0,255] */
     uint32_t i1 = (i0 + 1u) & (uint32_t)(SUBWT_SIZE - 1u); /* ガード点へ折返し */
-    /* 小数部 25bit フル精度 (旧 8bit は低音域で量子化ノイズの濁りを生んでいた) */
-    float fr = (float)(ph & 0x01FFFFFFu) * (1.0f / 33554432.0f);
+    /* 小数部 24bit フル精度 */
+    float fr = (float)(ph & 0x00FFFFFFu) * (1.0f / 16777216.0f);
     const float *Ta = T[ta];
     float va = Ta[i0] * (1.0f - fr) + Ta[i1] * fr;
     if (tb != ta) {
@@ -919,10 +950,10 @@ static inline float subwt_read_q32_single(const SubWavBank *bank, int mip,
                                           uint32_t ta, uint32_t ph)
 {
     const float (*T)[SUBWT_SIZE + 1] = bank->table[mip];
-    uint32_t i0 = ph >> 25;                       /* 上位 7bit -> bin [0,127] */
+    uint32_t i0 = ph >> 24;                       /* 上位 8bit -> bin [0,255] */
     uint32_t i1 = (i0 + 1u) & (uint32_t)(SUBWT_SIZE - 1u); /* ガード点へ折返し */
-    /* 小数部 25bit フル精度 (単表 fast path も同様) */
-    float fr = (float)(ph & 0x01FFFFFFu) * (1.0f / 33554432.0f);
+    /* 小数部 24bit フル精度 (単表 fast path も同様) */
+    float fr = (float)(ph & 0x00FFFFFFu) * (1.0f / 16777216.0f);
     const float *Ta = T[ta];
     return Ta[i0] * (1.0f - fr) + Ta[i1] * fr;
 }
@@ -934,9 +965,9 @@ static inline float subwt_read_q32_single(const SubWavBank *bank, int mip,
  */
 static inline float subwt_read_raw_q32(const float *T, uint32_t ph)
 {
-    uint32_t i0 = ph >> 25;
+    uint32_t i0 = ph >> 24;
     uint32_t i1 = (i0 + 1u) & (uint32_t)(SUBWT_SIZE - 1u);
-    float fr = (float)(ph & 0x01FFFFFFu) * (1.0f / 33554432.0f);
+    float fr = (float)(ph & 0x00FFFFFFu) * (1.0f / 16777216.0f);
     /* Cortex-M4F VFMA.F32 (単一FMA 2サイクル): 乗算2回+加減算を単一命令へ集約 */
     return fmaf(T[i1] - T[i0], fr, T[i0]);
 }
@@ -999,6 +1030,8 @@ static inline void sub_channel_update_pan_gains(SubChannel *ch)
     float pan = ch->pan;
     if (!(pan >= 0.0f)) pan = 0.0f;   /* NaN/負値ガード */
     if (pan > 1.0f) pan = 1.0f;
+    if (pan <= 0.0f) { ch->pan_gain_l = 1.0f; ch->pan_gain_r = 0.0f; return; }
+    if (pan >= 1.0f) { ch->pan_gain_l = 0.0f; ch->pan_gain_r = 1.0f; return; }
     float ang = pan * ((float)M_PI * 0.5f);
     ch->pan_gain_l = cosf(ang);
     ch->pan_gain_r = sinf(ang);

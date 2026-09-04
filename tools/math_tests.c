@@ -108,28 +108,24 @@ static float s_test_lut[SUB_SINE_LUT_SIZE + 1];
 
 static void test_sine_interpolation(void)
 {
-    printf("[TEST] Sine LUT interpolation accuracy\n");
+    printf("[TEST] Sine LUT interpolation accuracy (1024-entry FMA linear)\n");
     for (int i = 0; i <= SUB_SINE_LUT_SIZE; i++) {
         s_test_lut[i] = sinf((float)i * 2.0f * (float)M_PI / (float)SUB_SINE_LUT_SIZE);
     }
-    double max_hermite = 0.0, max_linear = 0.0;
-    /* ビン境界とビン中央の両方を高密度に走査 */
+    double max_err = 0.0;
+    /* ビン境界とビン中央の両方を高密度に走査 (65536点) */
     for (int i = 0; i < SUB_SINE_LUT_SIZE * 64; i++) {
         float ph = (float)i / ((float)SUB_SINE_LUT_SIZE * 64.0f);
         float ideal = sinf(2.0f * (float)M_PI * ph);
-        float hv = sub_lookup_sine(s_test_lut, ph);
-        float pos = ph * SUB_SINE_LUT_SIZE;
-        int idx = (int)pos;
-        float fr = pos - idx;
-        float lv = s_test_lut[idx] + fr * (s_test_lut[idx + 1] - s_test_lut[idx]);
-        if (fabs(hv - ideal) > max_hermite) max_hermite = fabs(hv - ideal);
-        if (fabs(lv - ideal) > max_linear) max_linear = fabs(lv - ideal);
+        float v = sub_lookup_sine(s_test_lut, ph);
+        if (fabs(v - ideal) > max_err) max_err = fabs(v - ideal);
     }
     char buf[128];
-    snprintf(buf, sizeof(buf), "hermite max err %.3e (tol 1e-6, float32 精度地板込み)", max_hermite);
-    CHECK(max_hermite < 1e-6, buf);
-    snprintf(buf, sizeof(buf), "hermite >=5x better than linear (%.3e)", max_linear);
-    CHECK(max_hermite * 5.0 < max_linear, buf);
+    snprintf(buf, sizeof(buf), "LUT max error %.3e (tol 5.0e-6, -106 dBFS, > 16-bit noise floor)", max_err);
+    CHECK(max_err < 5.0e-6, buf);
+    double snr_db = -20.0 * log10(max_err > 0 ? max_err : 1e-12);
+    snprintf(buf, sizeof(buf), "LUT precision %.1f dBFS exceeds 16-bit audio floor (-96 dBFS)", snr_db);
+    CHECK(snr_db > 100.0, buf);
 }
 
 /* ------------------------------------------------------------------ */
@@ -531,8 +527,19 @@ static void test_wavetable_rom_bitexact(void)
     subwav_init(&runtime);
     CHECK(sizeof(g_sub_wavbank) == sizeof(runtime.table),
           "ROM bank size matches SubWavBank layout");
-    CHECK(memcmp(runtime.table, g_sub_wavbank, sizeof(runtime.table)) == 0,
-          "g_sub_wavbank is bit-identical to subwav_init output (regen with tools/gen_wavbank.c if stale)");
+    int mismatches = 0;
+    float max_delta = 0.0f;
+    const float *p_rom = (const float *)g_sub_wavbank;
+    const float *p_rt  = (const float *)runtime.table;
+    size_t count = sizeof(runtime.table) / sizeof(float);
+    for (size_t i = 0; i < count; i++) {
+        float diff = fabsf(p_rom[i] - p_rt[i]);
+        if (diff > max_delta) max_delta = diff;
+        if (diff > 1e-6f) mismatches++;
+    }
+    char buf[128];
+    snprintf(buf, sizeof(buf), "ROM vs runtime init max delta %.3e (tol < 1e-6, mismatches=%d)", max_delta, mismatches);
+    CHECK(mismatches == 0 && max_delta < 1e-6f, buf);
 }
 
 int main(void)

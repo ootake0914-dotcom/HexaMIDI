@@ -71,29 +71,41 @@ static inline void sub_spawn_build_sub2(SubSpawnDesc *d, uint8_t channel, uint8_
     float velocity = (float)vel / 127.0f;
 
     if (prog < 8) {
-        /* Acoustic Piano (0-7): 三角波 + パーカッシブADSR */
+        /* Acoustic Piano (0-7): 1ms鋭角ハンマー打弦アタック + クリスタル倍音開口 */
         d->wave = SUB_SPAWN_WAVE_TRIANGLE;
-        d->adsr_a = 0.003f; d->adsr_d = 0.400f; d->adsr_s = 0.250f; d->adsr_r = 0.090f;
+        d->adsr_a = 0.0010f; d->adsr_d = 0.350f; d->adsr_s = 0.250f; d->adsr_r = 0.080f;
+    } else if (prog >= 8 && prog < 16) {
+        /* Chromatic Perc (8-15): 鐘系パーカッシブ (host GM 表と統一) */
+        d->wave = SUB_SPAWN_WAVE_TRIANGLE;
+        d->adsr_a = 0.0010f; d->adsr_d = 0.300f; d->adsr_s = 0.250f; d->adsr_r = 0.080f;
     } else if (prog >= 16 && prog < 24) {
-        /* Organ (16-23): サイン波 + 高サステイン */
+        /* Organ (16-23): 2msキークリック立ち上がり + 豊潤サステイン */
         d->wave = SUB_SPAWN_WAVE_SINE;
-        d->adsr_a = 0.010f; d->adsr_d = 0.050f; d->adsr_s = 0.900f; d->adsr_r = 0.040f;
+        d->adsr_a = 0.0020f; d->adsr_d = 0.050f; d->adsr_s = 0.900f; d->adsr_r = 0.040f;
     } else if (prog >= 24 && prog < 32) {
-        /* Guitar (24-31): ノコギリ波 + プラック */
+        /* Guitar (24-31): 0.8ms超鋭角ピックプラック */
         d->wave = SUB_SPAWN_WAVE_SAWTOOTH;
-        d->adsr_a = 0.002f; d->adsr_d = 0.200f; d->adsr_s = 0.400f; d->adsr_r = 0.060f;
-    } else if (prog >= 40 && prog < 48) {
-        /* Strings (40-47): スローアタック */
-        d->wave = SUB_SPAWN_WAVE_SAWTOOTH;
-        d->adsr_a = 0.050f; d->adsr_d = 0.100f; d->adsr_s = 0.850f; d->adsr_r = 0.120f;
-    } else if (prog >= 56 && prog < 64) {
-        /* Brass (56-63): ノコギリ波 + ブラスアタック */
-        d->wave = SUB_SPAWN_WAVE_SAWTOOTH;
-        d->adsr_a = 0.020f; d->adsr_d = 0.080f; d->adsr_s = 0.800f; d->adsr_r = 0.060f;
-    } else {
-        /* Lead (80-87) / Synth / Other: 矩形波 / ノコギリ波 */
+        d->adsr_a = 0.0008f; d->adsr_d = 0.220f; d->adsr_s = 0.350f; d->adsr_r = 0.060f;
+    } else if (prog >= 32 && prog < 40) {
+        /* Bass (32-39): ファットな矩形波 (host GM 表と統一。Sub3 へ回るのが本筋) */
         d->wave = SUB_SPAWN_WAVE_SQUARE;
-        d->adsr_a = 0.005f; d->adsr_d = 0.080f; d->adsr_s = 0.650f; d->adsr_r = 0.050f;
+        d->adsr_a = 0.0010f; d->adsr_d = 0.180f; d->adsr_s = 0.650f; d->adsr_r = 0.050f;
+    } else if (prog >= 40 && prog < 48) {
+        /* Strings (40-47): 8msボウイング初動アタック (もたつき排除) */
+        d->wave = SUB_SPAWN_WAVE_SAWTOOTH;
+        d->adsr_a = 0.0080f; d->adsr_d = 0.120f; d->adsr_s = 0.850f; d->adsr_r = 0.140f;
+    } else if (prog >= 48 && prog < 56) {
+        /* Ensemble (48-55): ストリングス寄り (host GM 表と統一) */
+        d->wave = SUB_SPAWN_WAVE_SAWTOOTH;
+        d->adsr_a = 0.0040f; d->adsr_d = 0.120f; d->adsr_s = 0.800f; d->adsr_r = 0.120f;
+    } else if (prog >= 56 && prog < 64) {
+        /* Brass (56-63): 2.5msリップアタック「パァン！」 */
+        d->wave = SUB_SPAWN_WAVE_SAWTOOTH;
+        d->adsr_a = 0.0025f; d->adsr_d = 0.080f; d->adsr_s = 0.800f; d->adsr_r = 0.060f;
+    } else {
+        /* Lead (80-87) / Synth / Other: 1ms超高速アタック・高エネルギー立ち上がり */
+        d->wave = SUB_SPAWN_WAVE_SQUARE;
+        d->adsr_a = 0.0010f; d->adsr_d = 0.080f; d->adsr_s = 0.650f; d->adsr_r = 0.050f;
     }
     d->exp_decay = 1u;
     d->unison = ((!gov_unison_off &&
@@ -128,19 +140,27 @@ static inline void sub_spawn_build_sub2(SubSpawnDesc *d, uint8_t channel, uint8_
     }
     d->mip = subwt_pick_mip(base_freq);
 
-    /* ペルボイス共振LPF + フィルターエンベロープ (音色別キャラクタ) */
+    /* ペルボイス共振LPF + フィルターエンベロープ (初動倍音開口ブースト) */
     {
         float base_hz, peak_add, q;
-        if (prog < 8) {            /* Piano: 柔らかい三角 + 中域ピーク */
-            base_hz = 700.0f;  peak_add = 2200.0f; q = 0.90f;
-        } else if (prog >= 16 && prog < 24) { /* Organ: 明るめ・控えめな倍音制御 */
-            base_hz = 1400.0f; peak_add = 700.0f;  q = 0.70f;
-        } else if (prog >= 24 && prog < 32) { /* Guitar: プラッキーな立ち上がり */
-            base_hz = 900.0f;  peak_add = 3200.0f; q = 1.40f;
-        } else if (prog >= 40 && prog < 48) { /* Strings: 豊かなストレイン */
-            base_hz = 650.0f;  peak_add = 1900.0f; q = 0.85f;
-        } else {                   /* Lead/Synth: アグレッシブなスイープ */
-            base_hz = 1000.0f; peak_add = 3400.0f; q = 1.20f;
+        if (prog < 8) {            /* Piano: 抜ける打鍵倍音 (4.4kHz開口) */
+            base_hz = 850.0f;  peak_add = 3600.0f; q = 1.05f;
+        } else if (prog >= 8 && prog < 16) { /* Chromatic: ピアノ寄り鐘系 */
+            base_hz = 850.0f;  peak_add = 3600.0f; q = 1.05f;
+        } else if (prog >= 16 && prog < 24) { /* Organ: 明るいトーンホイール抜け */
+            base_hz = 1500.0f; peak_add = 1200.0f; q = 0.75f;
+        } else if (prog >= 24 && prog < 32) { /* Guitar: 強烈なアタックエッジ (5kHz開口) */
+            base_hz = 1000.0f; peak_add = 4200.0f; q = 1.20f;
+        } else if (prog >= 32 && prog < 40) { /* Bass: タイトな重低音 (Sub3 寄り) */
+            base_hz = 300.0f;  peak_add = 2200.0f; q = 1.30f;
+        } else if (prog >= 40 && prog < 48) { /* Strings: 打頭オープン (3.3kHz開口) */
+            base_hz = 750.0f;  peak_add = 2600.0f; q = 0.90f;
+        } else if (prog >= 48 && prog < 56) { /* Ensemble: ストリングス寄り */
+            base_hz = 750.0f;  peak_add = 2600.0f; q = 0.90f;
+        } else if (prog >= 56 && prog < 64) { /* Brass: 鋭いリップ開口 (5.1kHz開口) */
+            base_hz = 1100.0f; peak_add = 4000.0f; q = 1.25f;
+        } else {                   /* Lead/Synth: アグレッシブなハイパースイープ (6kHz開口) */
+            base_hz = 1200.0f; peak_add = 4800.0f; q = 1.35f;
         }
         float kt_in = base_freq * (1.0f / 261.6256f);
         float keytrack = sqrtf(sqrtf(kt_in));
@@ -174,33 +194,41 @@ static inline void sub_spawn_build_sub3(SubSpawnDesc *d, uint8_t channel, uint8_
     d->is_bass = is_bass;
     d->exp_decay = 1u;
     if (is_bass) {
-        /* Bass (32-39): ファットな矩形波/ノコギリ波 + サブオシ重低音 */
+        /* Bass (32-39): ファットな矩形波/ノコギリ波 + スラップスナップ打頭倍音 + サブオシ重低音 */
         d->wave = (prog == 38) ? SUB_SPAWN_WAVE_SAWTOOTH : SUB_SPAWN_WAVE_SQUARE;
-        d->adsr_a = 0.003f; d->adsr_d = 0.180f; d->adsr_s = 0.700f; d->adsr_r = 0.050f;
+        d->adsr_a = 0.0010f; d->adsr_d = 0.180f; d->adsr_s = 0.650f; d->adsr_r = 0.050f;
     } else if (prog < 8) {
-        /* Acoustic Piano (0-7): 三角波 + パーカッシブ減衰 ADSR (Sub2と音色整合) */
+        /* Acoustic Piano (0-7): 1ms鋭角ハンマー打弦アタック (Sub2と音色整合) */
         d->wave = SUB_SPAWN_WAVE_TRIANGLE;
-        d->adsr_a = 0.003f; d->adsr_d = 0.400f; d->adsr_s = 0.250f; d->adsr_r = 0.090f;
+        d->adsr_a = 0.0010f; d->adsr_d = 0.350f; d->adsr_s = 0.250f; d->adsr_r = 0.080f;
+    } else if (prog >= 8 && prog < 16) {
+        /* Chromatic Perc (8-15): 鐘系パーカッシブ (host GM 表と統一) */
+        d->wave = SUB_SPAWN_WAVE_TRIANGLE;
+        d->adsr_a = 0.0010f; d->adsr_d = 0.300f; d->adsr_s = 0.250f; d->adsr_r = 0.080f;
     } else if (prog >= 16 && prog < 24) {
-        /* Organ (16-23): サイン波 + 高サステイン */
+        /* Organ (16-23): 2msキークリック立ち上がり + 高サステイン */
         d->wave = SUB_SPAWN_WAVE_SINE;
-        d->adsr_a = 0.010f; d->adsr_d = 0.050f; d->adsr_s = 0.900f; d->adsr_r = 0.040f;
+        d->adsr_a = 0.0020f; d->adsr_d = 0.050f; d->adsr_s = 0.900f; d->adsr_r = 0.040f;
     } else if (prog >= 40 && prog < 48) {
-        /* Strings (40-47): ノコギリ波 + スローアタック & 高サステイン */
+        /* Strings (40-47): 8msボウイング初動アタック & 豊潤サステイン */
         d->wave = SUB_SPAWN_WAVE_SAWTOOTH;
-        d->adsr_a = 0.060f; d->adsr_d = 0.120f; d->adsr_s = 0.850f; d->adsr_r = 0.150f;
+        d->adsr_a = 0.0080f; d->adsr_d = 0.120f; d->adsr_s = 0.850f; d->adsr_r = 0.140f;
+    } else if (prog >= 48 && prog < 56) {
+        /* Ensemble (48-55): ストリングス寄り (host GM 表と統一) */
+        d->wave = SUB_SPAWN_WAVE_SAWTOOTH;
+        d->adsr_a = 0.0040f; d->adsr_d = 0.120f; d->adsr_s = 0.800f; d->adsr_r = 0.120f;
     } else if (prog >= 24 && prog < 32) {
-        /* Guitar (24-31): ノコギリ波 + 減衰 */
+        /* Guitar (24-31): 0.8ms超鋭角ピックプラック */
         d->wave = SUB_SPAWN_WAVE_SAWTOOTH;
-        d->adsr_a = 0.002f; d->adsr_d = 0.220f; d->adsr_s = 0.400f; d->adsr_r = 0.060f;
+        d->adsr_a = 0.0008f; d->adsr_d = 0.220f; d->adsr_s = 0.350f; d->adsr_r = 0.060f;
     } else if (prog >= 88 && prog < 96) {
-        /* Pad / Warm / Choir: 三角波 + ロングエンベロープ */
+        /* Pad / Warm / Choir: 15msアタック + 豊潤エンベロープ */
         d->wave = SUB_SPAWN_WAVE_TRIANGLE;
-        d->adsr_a = 0.100f; d->adsr_d = 0.200f; d->adsr_s = 0.800f; d->adsr_r = 0.200f;
+        d->adsr_a = 0.0150f; d->adsr_d = 0.200f; d->adsr_s = 0.800f; d->adsr_r = 0.200f;
     } else {
-        /* Other / Default: ノコギリ波 */
+        /* Other / Default: 1.5msアタック */
         d->wave = SUB_SPAWN_WAVE_SAWTOOTH;
-        d->adsr_a = 0.010f; d->adsr_d = 0.100f; d->adsr_s = 0.700f; d->adsr_r = 0.080f;
+        d->adsr_a = 0.0015f; d->adsr_d = 0.100f; d->adsr_s = 0.700f; d->adsr_r = 0.080f;
     }
     d->unison = 0u;
     d->wt_active = 0u;
@@ -209,19 +237,23 @@ static inline void sub_spawn_build_sub3(SubSpawnDesc *d, uint8_t channel, uint8_
     d->mip = 0u;
     d->morph_w = 0.0f;
 
-    /* ペルボイス共振LPF (低域寄りのキャラクタ) */
+    /* ペルボイス共振LPF (初動倍音開口ブースト) */
     {
         float base_hz, peak_add, q;
-        if (is_bass) {                      /* Bass: タイトな重低音 */
-            base_hz = 160.0f;  peak_add = 900.0f;  q = 1.10f;
-        } else if (prog < 8) {              /* Piano: 抜けの良い自然な高域 */
-            base_hz = 1200.0f; peak_add = 3000.0f; q = 0.75f;
-        } else if (prog >= 40 && prog < 48) { /* Strings: 豊かなストレイン */
-            base_hz = 600.0f;  peak_add = 1500.0f; q = 0.80f;
+        if (is_bass) {                      /* Bass: タイトな重低音 + 鋭いスラップ開口 (2.4kHz) */
+            base_hz = 180.0f;  peak_add = 2200.0f; q = 1.30f;
+        } else if (prog < 8) {              /* Piano: 抜けの良い自然な高域 (4.8kHz) */
+            base_hz = 1200.0f; peak_add = 3600.0f; q = 0.85f;
+        } else if (prog >= 8 && prog < 16) { /* Chromatic: ピアノ寄り */
+            base_hz = 1200.0f; peak_add = 3600.0f; q = 0.85f;
+        } else if (prog >= 40 && prog < 48) { /* Strings: 豊かなアタック開口 (3.1kHz) */
+            base_hz = 700.0f;  peak_add = 2400.0f; q = 0.85f;
+        } else if (prog >= 48 && prog < 56) { /* Ensemble: ストリングス寄り */
+            base_hz = 700.0f;  peak_add = 2400.0f; q = 0.85f;
         } else if (prog >= 88 && prog < 96) { /* Pad: 柔らかなローパス */
-            base_hz = 500.0f;  peak_add = 1200.0f; q = 0.70f;
+            base_hz = 550.0f;  peak_add = 1400.0f; q = 0.70f;
         } else {                              /* Default */
-            base_hz = 400.0f;  peak_add = 1600.0f; q = 1.00f;
+            base_hz = 500.0f;  peak_add = 2000.0f; q = 1.10f;
         }
         /* キートラッキング: ベースは低音の太さを優先して緩い 0.15 乗則、
          * それ以外は 0.25 乗則で高音域の開きを確保する */

@@ -124,12 +124,16 @@ typedef struct {
 static Sub2LeadEngine s_sub2;
 static bool s_hq_wide = false; /* 余裕時HQワイドデチューン (512B増分と同様に破綻なし) */
 static bool s_sub2_hp_bypass = false; /* GOV2(1-osc)時バスHPラムブル除去をbypass */
+/* thin化ヒステリシスラッチ: 9声でthin化→6声以下で復帰。境界での毎エポック反転を防ぐ */
+static bool s_sub2_thin = false;
 static SubKickEngine s_sub2_kick; /* Phase 4: C4 から移行された Kick のホスト状態 */
 static SubMetalEngine s_sub2_metal; /* Phase 5: C4 から移行された Metal のホスト状態 */
 static SubPercEngine s_sub2_perc; /* Phase 6: C4 から移行された Perc のホスト状態 */
 
 /* サンプルオフセット対応: エポック内MIDIイベントを一時蓄積 */
-#define SUB2_MAX_PENDING 256
+/* 256->512 (+3KB)。密集譜面のNOTE/CCロストによる音痩せ・処理落ち連鎖を防止。
+ * 溢れ時ソートはO(n^2)だがドロップより安い */
+#define SUB2_MAX_PENDING 512
 static AsmpPacket s_sub2_pending[SUB2_MAX_PENDING];
 static uint32_t s_sub2_pending_cnt = 0;
 
@@ -141,6 +145,7 @@ static void sub2_engine_init(Sub2LeadEngine *eng, AsmpSharedContext *shared)
     memset(eng, 0, sizeof(Sub2LeadEngine));
     eng->shared = shared;
     eng->lfsr_state = 0x1234ABCDu;
+    s_sub2_thin = false; /* ヒステリシスラッチも初期化 (曲替えでthin残留させない) */
     /* g_sine_lut const, no init */
     sub_freq_lut_init();
     /* ウェーブテーブルは ROM 常数 g_sub_wavbank を使用 (RAM 24.8KB 削減) */
@@ -986,14 +991,19 @@ static void sub2_render_classic5(VoiceSub2 * __restrict v, const SubChannel * __
         for (uint32_t f4 = 0; f4 < tile_frames; f4 += 4) {
             uint32_t chunk = tile_frames - f4;
             if (chunk > 4) chunk = 4;
-    
+
             /* 4 サンプル毎の LFO ビブラート / ピッチ増分更新 */
             v->vib_phase += v->vib_inc * 4.0f;
             if (v->vib_phase >= 1.0f) v->vib_phase -= 1.0f;
             float vib_semi = vib_depth * sub_lookup_sine(g_sine_lut, v->vib_phase);
             dt = v->base_increment * sub_semitone_ratio(ch_bend + vib_semi + drift_semi);
             v->phase_increment = dt;
-    
+            /* デチューン増分ホイスト: 毎samp 8VMUL→4VMUL/4sampへ(12VMUL削減/4samp) */
+            const float dt1 = dt * SUB2_DETUNE_RATIO_HI;
+            const float dt2 = dt * SUB2_DETUNE_RATIO_LO;
+            const float dt3 = dt * detune_hi2;
+            const float dt4 = dt * detune_lo2;
+
             for (uint32_t k = 0; k < chunk; k++) {
                 uint32_t f = f4 + k;
                 float env = sub_env_advance(&v->env);
@@ -1002,18 +1012,18 @@ static void sub2_render_classic5(VoiceSub2 * __restrict v, const SubChannel * __
                     goto exit_classic5;
                 }
                 v->age_samples++;
-    
+
                 float o1 = sub2_wave_at(wt, ph0, dt, g_sine_lut);
-                float o2 = sub2_wave_at(wt, ph1, dt * SUB2_DETUNE_RATIO_HI, g_sine_lut);
-                float o3 = sub2_wave_at(wt, ph2, dt * SUB2_DETUNE_RATIO_LO, g_sine_lut);
-                float o4 = sub2_wave_at(wt, ph3, dt * detune_hi2, g_sine_lut);
-                float o5 = sub2_wave_at(wt, ph4, dt * detune_lo2, g_sine_lut);
-    
+                float o2 = sub2_wave_at(wt, ph1, dt1, g_sine_lut);
+                float o3 = sub2_wave_at(wt, ph2, dt2, g_sine_lut);
+                float o4 = sub2_wave_at(wt, ph3, dt3, g_sine_lut);
+                float o5 = sub2_wave_at(wt, ph4, dt4, g_sine_lut);
+
                 float osc = fmaf(o5, 0.32f, fmaf(o4, 0.32f, fmaf(o3, 0.32f, fmaf(o2, 0.32f, o1 * 0.32f))));
                 float side = (o2 + o4) - (o3 + o5);
-    
+
                 float filtered = sub_svf_lp(&v->svf, osc);
-    
+
                 float spread = side * env * ch_gain * 0.35f;
                     float l, r;
                     spatial_process_sample(&v->spatial, filtered * env * ch_gain, spatial_az, spatial_itd,
@@ -1022,13 +1032,13 @@ static void sub2_render_classic5(VoiceSub2 * __restrict v, const SubChannel * __
                     r -= spread * spatial_r_gain;
                     mix_l[f] += l;
                     mix_r[f] += r;
-                
-    
+
+
                 ph0 += dt; if (ph0 >= 1.0f) ph0 -= 1.0f;
-                ph1 += dt * SUB2_DETUNE_RATIO_HI; if (ph1 >= 1.0f) ph1 -= 1.0f;
-                ph2 += dt * SUB2_DETUNE_RATIO_LO; if (ph2 >= 1.0f) ph2 -= 1.0f;
-                ph3 += dt * detune_hi2; if (ph3 >= 1.0f) ph3 -= 1.0f;
-                ph4 += dt * detune_lo2; if (ph4 >= 1.0f) ph4 -= 1.0f;
+                ph1 += dt1; if (ph1 >= 1.0f) ph1 -= 1.0f;
+                ph2 += dt2; if (ph2 >= 1.0f) ph2 -= 1.0f;
+                ph3 += dt3; if (ph3 >= 1.0f) ph3 -= 1.0f;
+                ph4 += dt4; if (ph4 >= 1.0f) ph4 -= 1.0f;
             }
         }
     } else {
@@ -1042,7 +1052,11 @@ static void sub2_render_classic5(VoiceSub2 * __restrict v, const SubChannel * __
             float vib_semi = vib_depth * sub_lookup_sine(g_sine_lut, v->vib_phase);
             dt = v->base_increment * sub_semitone_ratio(ch_bend + vib_semi + drift_semi);
             v->phase_increment = dt;
-    
+            const float dt1b = dt * SUB2_DETUNE_RATIO_HI;
+            const float dt2b = dt * SUB2_DETUNE_RATIO_LO;
+            const float dt3b = dt * detune_hi2;
+            const float dt4b = dt * detune_lo2;
+
             for (uint32_t k = 0; k < chunk; k++) {
                 uint32_t f = f4 + k;
                 float env = sub_env_advance(&v->env);
@@ -1051,18 +1065,18 @@ static void sub2_render_classic5(VoiceSub2 * __restrict v, const SubChannel * __
                     goto exit_classic5;
                 }
                 v->age_samples++;
-    
+
                 float o1 = sub2_wave_at(wt, ph0, dt, g_sine_lut);
-                float o2 = sub2_wave_at(wt, ph1, dt * SUB2_DETUNE_RATIO_HI, g_sine_lut);
-                float o3 = sub2_wave_at(wt, ph2, dt * SUB2_DETUNE_RATIO_LO, g_sine_lut);
-                float o4 = sub2_wave_at(wt, ph3, dt * detune_hi2, g_sine_lut);
-                float o5 = sub2_wave_at(wt, ph4, dt * detune_lo2, g_sine_lut);
-    
+                float o2 = sub2_wave_at(wt, ph1, dt1b, g_sine_lut);
+                float o3 = sub2_wave_at(wt, ph2, dt2b, g_sine_lut);
+                float o4 = sub2_wave_at(wt, ph3, dt3b, g_sine_lut);
+                float o5 = sub2_wave_at(wt, ph4, dt4b, g_sine_lut);
+
                 float osc = fmaf(o5, 0.32f, fmaf(o4, 0.32f, fmaf(o3, 0.32f, fmaf(o2, 0.32f, o1 * 0.32f))));
                 float side = (o2 + o4) - (o3 + o5);
-    
+
                 float filtered = sub_svf_lp(&v->svf, osc);
-    
+
                 float spread = side * env * ch_gain * 0.35f;
                     /* #音質改善C: spread は既に env*ch_gain 込み (下記 spatial_on 分岐と同型)。
                      * 従来コードは (filtered+spread)*env*ch_gain としており spread 側に
@@ -1071,13 +1085,13 @@ static void sub2_render_classic5(VoiceSub2 * __restrict v, const SubChannel * __
                     float base = filtered * env * ch_gain;
                     mix_l[f] += (base + spread) * pan_l;
                     mix_r[f] += (base - spread) * pan_r;
-                
-    
+
+
                 ph0 += dt; if (ph0 >= 1.0f) ph0 -= 1.0f;
-                ph1 += dt * SUB2_DETUNE_RATIO_HI; if (ph1 >= 1.0f) ph1 -= 1.0f;
-                ph2 += dt * SUB2_DETUNE_RATIO_LO; if (ph2 >= 1.0f) ph2 -= 1.0f;
-                ph3 += dt * detune_hi2; if (ph3 >= 1.0f) ph3 -= 1.0f;
-                ph4 += dt * detune_lo2; if (ph4 >= 1.0f) ph4 -= 1.0f;
+                ph1 += dt1b; if (ph1 >= 1.0f) ph1 -= 1.0f;
+                ph2 += dt2b; if (ph2 >= 1.0f) ph2 -= 1.0f;
+                ph3 += dt3b; if (ph3 >= 1.0f) ph3 -= 1.0f;
+                ph4 += dt4b; if (ph4 >= 1.0f) ph4 -= 1.0f;
             }
         }
     }
@@ -1122,7 +1136,9 @@ static void sub2_render_classic3(VoiceSub2 * __restrict v, const SubChannel * __
             float vib_semi = vib_depth * sub_lookup_sine(g_sine_lut, v->vib_phase);
             dt = v->base_increment * sub_semitone_ratio(ch_bend + vib_semi + drift_semi);
             v->phase_increment = dt;
-    
+            const float dt1c = dt * SUB2_DETUNE_RATIO_HI;
+            const float dt2c = dt * SUB2_DETUNE_RATIO_LO;
+
             for (uint32_t k = 0; k < chunk; k++) {
                 uint32_t f = f4 + k;
                 float env = sub_env_advance(&v->env);
@@ -1131,16 +1147,16 @@ static void sub2_render_classic3(VoiceSub2 * __restrict v, const SubChannel * __
                     goto exit_classic3;
                 }
                 v->age_samples++;
-    
+
                 float o1 = sub2_wave_at(wt, ph0, dt, g_sine_lut);
-                float o2 = sub2_wave_at(wt, ph1, dt * SUB2_DETUNE_RATIO_HI, g_sine_lut);
-                float o3 = sub2_wave_at(wt, ph2, dt * SUB2_DETUNE_RATIO_LO, g_sine_lut);
-    
+                float o2 = sub2_wave_at(wt, ph1, dt1c, g_sine_lut);
+                float o3 = sub2_wave_at(wt, ph2, dt2c, g_sine_lut);
+
                 float osc = fmaf(o3, 0.42f, fmaf(o2, 0.42f, o1 * 0.42f));
                 float side = o2 - o3;
-    
+
                 float filtered = sub_svf_lp(&v->svf, osc);
-    
+
                 float spread = side * env * ch_gain * 0.35f;
                     float l, r;
                     spatial_process_sample(&v->spatial, filtered * env * ch_gain, spatial_az, spatial_itd,
@@ -1149,11 +1165,11 @@ static void sub2_render_classic3(VoiceSub2 * __restrict v, const SubChannel * __
                     r -= spread * spatial_r_gain;
                     mix_l[f] += l;
                     mix_r[f] += r;
-                
-    
+
+
                 ph0 += dt; if (ph0 >= 1.0f) ph0 -= 1.0f;
-                ph1 += dt * SUB2_DETUNE_RATIO_HI; if (ph1 >= 1.0f) ph1 -= 1.0f;
-                ph2 += dt * SUB2_DETUNE_RATIO_LO; if (ph2 >= 1.0f) ph2 -= 1.0f;
+                ph1 += dt1c; if (ph1 >= 1.0f) ph1 -= 1.0f;
+                ph2 += dt2c; if (ph2 >= 1.0f) ph2 -= 1.0f;
             }
         }
     } else {
@@ -1167,7 +1183,9 @@ static void sub2_render_classic3(VoiceSub2 * __restrict v, const SubChannel * __
             float vib_semi = vib_depth * sub_lookup_sine(g_sine_lut, v->vib_phase);
             dt = v->base_increment * sub_semitone_ratio(ch_bend + vib_semi + drift_semi);
             v->phase_increment = dt;
-    
+            const float dt1d = dt * SUB2_DETUNE_RATIO_HI;
+            const float dt2d = dt * SUB2_DETUNE_RATIO_LO;
+
             for (uint32_t k = 0; k < chunk; k++) {
                 uint32_t f = f4 + k;
                 float env = sub_env_advance(&v->env);
@@ -1176,16 +1194,16 @@ static void sub2_render_classic3(VoiceSub2 * __restrict v, const SubChannel * __
                     goto exit_classic3;
                 }
                 v->age_samples++;
-    
+
                 float o1 = sub2_wave_at(wt, ph0, dt, g_sine_lut);
-                float o2 = sub2_wave_at(wt, ph1, dt * SUB2_DETUNE_RATIO_HI, g_sine_lut);
-                float o3 = sub2_wave_at(wt, ph2, dt * SUB2_DETUNE_RATIO_LO, g_sine_lut);
-    
+                float o2 = sub2_wave_at(wt, ph1, dt1d, g_sine_lut);
+                float o3 = sub2_wave_at(wt, ph2, dt2d, g_sine_lut);
+
                 float osc = fmaf(o3, 0.42f, fmaf(o2, 0.42f, o1 * 0.42f));
                 float side = o2 - o3;
-    
+
                 float filtered = sub_svf_lp(&v->svf, osc);
-    
+
                 float spread = side * env * ch_gain * 0.35f;
                     /* #音質改善C: spread は既に env*ch_gain 込み (下記 spatial_on 分岐と同型)。
                      * 従来コードは (filtered+spread)*env*ch_gain としており spread 側に
@@ -1194,11 +1212,11 @@ static void sub2_render_classic3(VoiceSub2 * __restrict v, const SubChannel * __
                     float base = filtered * env * ch_gain;
                     mix_l[f] += (base + spread) * pan_l;
                     mix_r[f] += (base - spread) * pan_r;
-                
-    
+
+
                 ph0 += dt; if (ph0 >= 1.0f) ph0 -= 1.0f;
-                ph1 += dt * SUB2_DETUNE_RATIO_HI; if (ph1 >= 1.0f) ph1 -= 1.0f;
-                ph2 += dt * SUB2_DETUNE_RATIO_LO; if (ph2 >= 1.0f) ph2 -= 1.0f;
+                ph1 += dt1d; if (ph1 >= 1.0f) ph1 -= 1.0f;
+                ph2 += dt2d; if (ph2 >= 1.0f) ph2 -= 1.0f;
             }
         }
     }
@@ -1343,14 +1361,19 @@ static bool sub2_render(Sub2LeadEngine *eng, float *buffer, uint32_t frames, uin
         }
     }
 
-    /* M4F 156MHz デッドライン厳守:
-     * ボイス数 <= 4: 極太3オシレータ (スーパーソウ) + 空間音響
-     * ボイス数 > 4: 1オシレータ (+SVF LPF) で16音全開でも3.5ms以内に完走 */
+    /* M4F 156MHz デッドライン厳守 (ヒステリシス付き):
+     * 9声でthin化 (1オシレータ+spatial off) → 6声以下で復帰 (3オシレータ+spatial)。
+     * 7〜8声の往復で毎エポック音色反転させない。16音全開でも5ms以内に完走 */
+    if (!s_sub2_thin && active_count > 8) {
+        s_sub2_thin = true;
+    } else if (s_sub2_thin && active_count <= 6) {
+        s_sub2_thin = false;
+    }
     int effective_osc = 1;
-    if (max_osc >= 3 && active_count <= 4) {
+    if (max_osc >= 3 && !s_sub2_thin) {
         effective_osc = 3;
     }
-    if (active_count > 4) {
+    if (s_sub2_thin) {
         spatial_on = false;
     }
 

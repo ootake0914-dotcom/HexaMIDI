@@ -169,7 +169,9 @@ int main(int argc, char *argv[])
     boot_diag_log("synth_main entered argc=%d", argc);
     boot_diag_beep(3, 2000);
 
-    float volume = 0.85f;
+    /* 既定音量 0.70: コントローラ既定・Sub5 マスタと統一。
+     * 0.85 では ch vol 0.8 との積み上げ＋密集ポリでクリップするため下げた */
+    float volume = 0.70f;
     if (argc > 1) {
         volume = (float)atof(argv[1]);
     }

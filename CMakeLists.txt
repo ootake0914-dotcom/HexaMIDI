@@ -45,6 +45,7 @@ set(COMMON_SOURCES
     src/async_logger.c
     src/boot_diag.c
     src/rt_profile.c
+    src/spectrum_analyzer.c
     asmp_sub/sub_sine_lut.c
     asmp_sub/sub_wavbank.c
     asmp_sub/sub_kick.c

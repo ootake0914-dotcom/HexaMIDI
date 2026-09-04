@@ -482,18 +482,9 @@ static void jukebox_update(SynthController *ctrl, const JoystickState *state,
 {
     jukebox_handle_e_f_volume(ctrl, e_pressed, f_pressed);
 
-    /* C ボタン: 立体音響 (Woodworth球モデル ITD/ILD) トグル */
+    /* C ボタン: 未割り当て (誤操作防止 / 将来の機能拡張用に予約) */
     if (state->pressed_buttons & BTN_MASK_C) {
-        if (ctrl->asmp) {
-            AsmpSharedContext *sc = asmp_manager_context((AsmpManager *)ctrl->asmp);
-            if (sc) {
-                sc->main_ctrl.spatial_enable ^= 1u;
-                async_logf("[SPATIAL] %s (Woodworth ITD %.2fms max)\n", sc->main_ctrl.spatial_enable ? "ON" : "OFF",
-                           (double)SPATIAL_HEAD_RADIUS / (double)SPATIAL_SPEED_OF_SOUND * (M_PI/2 + 1) * 1000.0);
-            }
-        } else {
-            async_logf("[SPATIAL] toggle ignored (single-core)\n");
-        }
+        /* no-op */
     }
 
     /* スティック押し込み (K): 演奏アクセントとしてスネア */

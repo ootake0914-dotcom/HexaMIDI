@@ -178,6 +178,11 @@ typedef struct {
     uint32_t lfsr_state;     /**< LFSR 乱数シード */
     uint32_t dither_rng;     /**< TPDF ディザ量子化用 PRNG シード */
 
+    /* ミックスバス DC ブロッカー状態 (L/R 各 x1/y1)。Sub5 と同一特性 r=0.995。
+     * 低域うねり蓄積を防ぐ出力段フィルタ。reset_effects でクリアする */
+    float dc_x1_l, dc_y1_l;
+    float dc_x1_r, dc_y1_r;
+
     /* 正弦波LUTは共有ROM g_sine_lutを使用 (RAM 4KB削減) */
 
     /* チャンネル別パン ゲイン表 (等価パワー)。

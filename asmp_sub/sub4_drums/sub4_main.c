@@ -42,7 +42,7 @@ static void sub4_sleep_us_impl(unsigned int us)
 #define SUB4_KICK_START_GHOST  (105.0f)   /* それ以下 */
 #define SUB4_KICK_TARGET       (48.0f)
 #define SUB4_KICK_SWEEP_EXP    (-11.0f)
-#define SUB4_KICK_CLICK_LEN    (72u)      /* ベータークリック長 (~1.5ms) */
+#define SUB4_KICK_CLICK_LEN    (64u)      /* ベータークリック長 (~1.3ms: hot master 下でも耳に痛くない短さ) */
 
 /* シンバル / ハット 6系統金属音の Q32 位相増分定数テーブル (TR-808 非整数比 6発振器準拠)
  * 263Hz, 400Hz, 421Hz, 474Hz, 587Hz, 845Hz @ 48kHz */
@@ -116,7 +116,8 @@ typedef struct {
 
 static Sub4DrumEngine s_sub4;
 
-#define SUB4_MAX_PENDING 256
+/* 256->512 (+3KB)。密集譜面のNOTEロスト(特に消音系の欠落→鳴りっぱなし)を防止 */
+#define SUB4_MAX_PENDING 512
 static AsmpPacket s_sub4_pending[SUB4_MAX_PENDING];
 static uint32_t s_sub4_pending_cnt = 0;
 
@@ -239,9 +240,9 @@ static void sub4_note_on(Sub4DrumEngine *eng, uint8_t note, float velocity)
 
     float decay_sec = 0.15f;
 
-    /* Kick: 初期位相をサイン頂点 (0.25) に置き、立上がりの過渡クリックを根絶 */
+    /* Kick: 初期位相 0.0 (ゼロクロス) から立ち上がり、打頭のアタック・パンチを最大化 */
     if (note == 35 || note == 36) {
-        v->phase = 0.25f;
+        v->phase = 0.0f;
     }
 
     if (note == 35 || note == 36) {
@@ -403,12 +404,12 @@ static void sub4_render_kick(DrumVoice *v, Sub4DrumEngine *eng, float *acc, uint
         if (d > 0.95f)       d = 0.95f;
         else if (d < -0.95f) d = -0.95f;
 
-        /* ベータークリック: 発音頭 ~1.5ms の HP ノイズバーストで
-         * ビーター アタック感を付与 (減衰しつつ自然に消える) */
+        /* ベータークリック: 発音頭 ~2.0ms の HP ノイズバーストで
+         * 強烈なビーター アタック感を付与 (減衰しつつ自然に消える) */
         if (samples_rendered <= SUB4_KICK_CLICK_LEN) {
             float cn = sub4_noise_fast(&eng->noise_seed);
             click_lp += 0.60f * (cn - click_lp);
-            d += (cn - click_lp) * 0.40f *
+            d += (cn - click_lp) * 0.65f *
                  (1.0f - (float)samples_rendered * (1.0f / (float)SUB4_KICK_CLICK_LEN));
         }
 
@@ -456,14 +457,14 @@ static void sub4_render_snare(DrumVoice *v, Sub4DrumEngine *eng, float *acc, uin
         float fm_mod = sub_lookup_sine(g_sine_lut, phase * 2.76f) * (env_level * 0.55f);
         float fm_tone = sub_lookup_sine(g_sine_lut, phase + fm_mod * 0.25f) * 0.35f;
 
-        float noise_gain = buzz ? 0.85f : (0.55f + 0.30f * (1.0f - prog));
+        float noise_gain = buzz ? 0.95f : (0.70f + 0.35f * (1.0f - prog));
         prog += prog_inc;
 
         /* ノイズを ~1.7kHz HP で締め「パシッ」とするスナップ感を付与
          * (生ノイズのままだと低域がゴロつき、ボディと混濁する) */
         float noise_raw = sub4_noise_fast(noise_seed) * noise_gain;
         snare_hp += 0.22f * (noise_raw - snare_hp);
-        float noise = (noise_raw - snare_hp) * 1.15f;
+        float noise = (noise_raw - snare_hp) * 1.35f;
         float out = tone + fm_tone + noise;
 
         acc[f] += out * env_level * gain;
@@ -749,10 +750,22 @@ static bool sub4_render(Sub4DrumEngine *eng, float *buffer, uint32_t frames, uin
     }
 
     for (uint32_t f = 0; f < frames; f++) {
-        float sample = acc[f];
-        sample = sample / (1.0f + fabsf(sample) * 0.5f);
-        buffer[f * 2 + 0] = sample;
-        buffer[f * 2 + 1] = sample;
+        /* 最適化+音質: 旧 sample/(1+|s|*0.5) は毎サンプル vdiv.f32(14cyc)。
+         * Sub5と同一のC1連続ソフトリミッタ(分岐+多項式、除算なし)へ統一。
+         * 線形域| x|<=0.85→3次ショルダー→±1天井で値・傾き連続、クリックなし */
+        float s = acc[f];
+        if (!SUB_ISFINITE_F(s)) s = 0.0f;
+        float ax = fabsf(s);
+        float y;
+        if (ax <= 0.85f) y = s;
+        else if (ax >= 1.30f) y = (s > 0.0f) ? 1.0f : -1.0f;
+        else {
+            const float u = ax - 0.85f;
+            const float m = u - u * u * 2.2222222f + u * u * u * 1.6460905f;
+            y = (s > 0.0f) ? (0.85f + m) : -(0.85f + m);
+        }
+        buffer[f * 2 + 0] = y;
+        buffer[f * 2 + 1] = y;
     }
 
     eng->shared->core[ASMP_CORE_SUB4_DRUM].voice_count = active_count;
